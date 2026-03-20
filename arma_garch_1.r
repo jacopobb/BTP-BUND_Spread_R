@@ -1,3 +1,10 @@
+####################################
+# ARMA-GARCH Workflow
+# Done for the 20/03 forecast
+# Goal is to predict the spread between BTP and BUND 
+# with an ARMA-GARCH model, done via an "automated" function
+####################################
+
 #### Packaged and random stuff ####
 
 rm(list = ls()) # clean enviroment
@@ -14,13 +21,22 @@ library(dplyr)
 library(httpgd)
 library(R.utils)
 library(xts)
+library(readxl)
 
 # to see plot on vscode: open the link at the start of the output
 # if on Rstudio eliminate the line (creates problems??)
-#hgd() 
+hgd() 
 
 #### Load and prepare data ####
-data  <- read.csv("spread.csv")
+#data  <- read.csv("data/spread_investing.csv")
+#data  <- xts(data[, -1], order.by = as.Date(data$date))
+#head(data)
+
+data <- read_excel("data/spread_refinitiv.xlsx")
+data <- data[-1,]
+data$`IT10DE10=TWEB (BID)` <- as.numeric(data$`IT10DE10=TWEB (BID)`) * -1
+
+names(data) <- c("date", "spread")
 data  <- xts(data[, -1], order.by = as.Date(data$date))
 head(data)
 
@@ -172,8 +188,8 @@ cat("\nFind best ARMA-GARCH model\n")
 # Can change the critera or modify the parameters, if too much combinations the code will run for ages
 
 best_garch <- function(y,
-                       ar_lags  = 0:3,
-                       ma_lags  = 0:3,
+                       ar_lags  = 0:2,
+                       ma_lags  = 0:2,
                        garch_p  = 1:2,
                        garch_q  = 1:2,
                        models   = c("sGARCH", "eGARCH"),
@@ -313,6 +329,8 @@ cat("\nModel validation:\n")
 # refit.every = 1 means we re-estimate the model every single iteration
 # If window.size too small the model will fail to converge
 
+c1 <- makeCluster(detectCores() - 1)
+
 roll <- ugarchroll(spec = garch_spec, 
                    data = ds, 
                    n.ahead = 1, 
@@ -322,8 +340,13 @@ roll <- ugarchroll(spec = garch_spec,
                    window.size = 300, 
                    solver = "hybrid",
                    calculate.VaR = TRUE,
-                   VaR.alpha = c(0.05, 0.25, 0.75, 0.95)) # Tells R to calculate our exact quantiles
+                   VaR.alpha = c(0.05, 0.25, 0.75, 0.95), 
+                   cluster = c1)
 
+# In case of non-convergence problems, re-run with other solvers
+roll <- resume(roll, solver = "gosolnp")
+roll <- resume(roll, solver = "nloptr")
+roll <- resume(roll, solver = "solnp")
 
 # Extract the density predictions and realized ds
 roll_df <- as.data.frame(roll)
@@ -439,12 +462,33 @@ cat("\n")
 cat("Forecast spread vs actual spread:\n")
 print(tail(df_spread))
 
+## Mean evaluation ###
+errors <- df_spread$actual_spread - df_spread$fc_spread
+mae <- mean(abs(errors))
+mse <- mean(errors^2)
+rmse <- sqrt(mse)
+mape <- mean(abs(errors / df_spread$actual_spread))
+dir_acc <- mean(sign(df_spread$actual_spread) == sign(df_spread$fc_spread))
+
+cat("\nMean evaluation metrics:\n")
+cat(sprintf("MAE: %.4f  |  MSE: %.4f  |  RMSE: %.4f  |  MAPE: %.4f  |  Dir. Acc: %.2f%%\n", 
+            mae, mse, rmse, mape, dir_acc * 100))
+
+## Distribution check ##
+# Check if actual value fall into 90%
+# 90% interval: q05 to q95
+coverage_90 <- mean(df_spread$actual_spread >= df_spread$ci_q05 & 
+                    df_spread$actual_spread <= df_spread$ci_q95)
+
+cat("\nDistribution evaluation, % of forecast that fall into that interval:\n")
+cat(sprintf("90%% coverage: %.4f\n", coverage_90)) 
+
 df_spread$date <- as.Date(rownames(df_spread))
 
 p_spreads  <- ggplot(df_spread, aes(x = date)) +
-  geom_line(aes(y = actual_spread*100, color = "Actual"), linewidth = 0.8) +
-  geom_line(aes(y = fc_spread*100, color = "Forecasted"), linewidth = 0.8) +
-  geom_ribbon(aes(ymin = ci_q05*100, ymax = ci_q95*100), fill = "blue", alpha = 0.3) +
+  geom_line(aes(y = actual_spread, color = "Actual"), linewidth = 0.8) +
+  geom_line(aes(y = fc_spread, color = "Forecasted"), linewidth = 0.8) +
+  geom_ribbon(aes(ymin = ci_q05, ymax = ci_q95), fill = "blue", alpha = 0.3) +
   scale_color_manual(values = c("Actual" = "black", "Forecasted" = "blue")) +
   labs(title = "Spread: Actual vs Forecasted", x = "", y = "Basis points") +
   scale_x_date(date_breaks = "1 year", date_labels = "%Y") +

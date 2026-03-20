@@ -4,31 +4,9 @@ output: html_document
 date: "2026-03-19"
 ---
 
-
 # SPREAD
-```{r setup}
-getwd()
-setwd("C:/Users/Jacopo/Desktop")
-```
-
 ## Data setup
 ```{r setup}
-#remove(list = ls())
-install.packages("readxl")
-install.packages("urca")
-install.packages("tseries")
-install.packages("forecast")
-install.packages("rugarch")
-install.packages("FinTS")
-install.packages("dplyr")
-install.packages("httpgd")
-install.packages("R.utils")
-install.packages("xts")
-install.packages("fBasics")
-install.packages("lmtest")
-install.packages("sandwich")
-install.packages("MTS")
-
 library(urca)
 library(tseries)
 library(quantmod)
@@ -49,8 +27,7 @@ library("MTS")
 
 Load the data from excel file, weekly spread 
 ```{r}
-data <- read_excel("Spread-weekly.xlsx")
-#View(data)
+data <- read_excel("data/spread_refinitiv.xlsx")
 ```
 
 Remove first row, as it contains NA
@@ -111,7 +88,7 @@ text(x = start(spread), y= mean,
 (using ARIMA model)  
 
 Check for stationarity
-```{r setup}
+```{r}
 library(fUnitRoots)
 library(urca)
 ```
@@ -196,11 +173,11 @@ Acf(as.numeric(diff_spread), main="ACF (Differenze)", lag.max = 30)
 Pacf(as.numeric(diff_spread), main="PACF (Differenze)", lag.max = 30)
 par(mfrow = c(1, 1)) 
 ```
-HOWEVER we first divide the dataset in train and test sets in order to evaluate tboth in-sample and out-sample of the ARIMA that we are going to estimate
+HOWERER we first divide the dataset in train and test sets in order to evaluate tboth in-sample and out-sample of the ARIMA that we are going to estimate
 (PENSO SAREBBE PIU CORRETTO FARE QUESTA DIVISIONE ANCHE NELLA PARTE PRECEDENTE IN CUI SI TESTA LA STAZIONARIETA' DELLA SERIA NON DIFFERENZIATA, ANCHE SE NON VA A INFLUENZARE LE NOSTRE FORECAST)
 
 ```{r}
-n_test  <- round(length(diff_spread) * 0)
+n_test  <- round(length(diff_spread) * 0.2)
 n_train <- length(diff_spread) - n_test
 
 train <- diff_spread[1:n_train]
@@ -376,6 +353,7 @@ m1_s52 <- auto.arima(train_ts52,max.q = 10, max.p = 10,method="ML",
                         approximation = FALSE,
                         trace = TRUE)
 summary(m1_s52)
+```
 
 MINE DI STAGIONALITA ANNULAE--> stagionalità annuale (52 settimane) non significativa
 
