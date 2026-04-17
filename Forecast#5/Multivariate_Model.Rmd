@@ -1,0 +1,554 @@
+---
+title: "Multivariate_Model_Forecast"
+output: html_document
+date: "2026-04-16"
+---
+```{r, eval=FALSE, include = FALSE}
+# ============================================================
+# MACOS OPTIMIZATION BLOCK (Apple Silicon)
+# ============================================================
+rm(list = ls())
+
+# 1. Verifica che R sia nativo ARM64 (non Rosetta 2)
+if (R.version$arch != "aarch64") {
+  warning("R non sta girando su ARM64. Reinstalla R nativo per Apple Silicon da cran.r-project.org")
+} else {
+  message("✓ R ARM64 nativo confermato: ", R.version$arch)
+}
+
+# 2. Configura parallelismo ottimale per macOS (usa FORK, molto più veloce di SOCKET)
+N_CORES <- detectCores(logical = FALSE) - 1  # core fisici, lascia 1 libero
+message("✓ Core disponibili per parallelismo: ", N_CORES)
+
+# 3. RNG riproducibile per simulazioni parallele
+RNGkind("L'Ecuyer-CMRG")
+seed <- 42
+set.seed(seed)
+
+# 4. Funzione helper: crea cluster FORK (macOS only)
+make_mac_cluster <- function() {
+  makeCluster(N_CORES, type = "FORK")  # FORK evita di riesportare variabili
+}
+
+# 5. Libera memoria dopo operazioni pesanti
+gc_after <- function(expr) {
+  result <- force(expr)
+  gc(verbose = FALSE)
+  result
+}
+
+message("✓ Blocco ottimizzazione macOS caricato.")
+# ============================================================
+
+```
+
+
+```{r setup, message=FALSE, warning=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+getwd()
+library(urca)
+library(tseries)
+library(quantmod)
+library(forecast)
+library(rugarch)
+library(FinTS)
+library(ggplot2)
+library(dplyr)
+library(httpgd)
+library(R.utils)
+library(xts)
+library(readxl)
+library(fBasics)
+library(lmtest)
+library(sandwich)
+library(lubridate)
+library(fUnitRoots)
+library(stats)
+library(graphics)
+library(MTS)
+library(MASS)
+library(zoo)
+library(forecast)
+library(seastests)
+library(strucchange)
+```
+
+## Multivariate Model
+We now switch models, and we'll use a multivariate model. Ideally we are going to use a VAR model, in which there will be 2 series : one will be the BTP-Bund Spread, and the other will be one between the EURO STR series or the EuroStoxx Banks series.
+If we have time, we could also use a trivariate VAR model, incorporating them all.
+
+```{r}
+data <- read_excel("Spread_daily_17_04.xlsx")
+data <- data |> na.omit() |> rename(date = Date, spread = `IT10DE10=TWEB (BID)`)
+data$spread <- data$spread * -1
+spread  <- xts(data[, -1], order.by = as.Date(data$date, format = "%d/%m/%y"))
+```
+
+Inspect data
+
+```{r}
+head(spread)
+str(spread)
+sum(is.na(spread))
+any(is.infinite(spread))
+```
+
+Plot the data
+
+```{r, echo = FALSE, fig.width=12, fig.height=10, out.width="100%"}
+df_plot <- data.frame(date = index(spread), spread = spread$spread)
+
+p <- ggplot(df_plot, aes(x = date, y = spread)) +
+  geom_line() +
+  labs(title = "BTP-BUND Spread", y ="Basis Points", x = "") +
+  theme_bw()
+
+print(p)
+```
+
+```{r, echo=FALSE}
+options(scipen = 999)
+basicStats(spread)
+```
+
+```{r}
+risultato_adf <- adfTest(spread, lags = 1, type = "c")
+print(risultato_adf)
+# Equivalent with auto determination of lags
+
+adf_test <- function(serie, nome_serie = "Serie") {
+  cat("\n==============================================\n")
+  cat("Stationarity test (ADF):", nome_serie, "\n")
+  cat("==============================================\n")
+  types <- c("none", "drift", "trend")
+  results <- lapply(types, function(t) {
+    test <- ur.df(serie, type = t, selectlags = "AIC")
+    stat <- test@teststat[1]
+    val <- test@cval[1, "5pct"]
+    result <- if (stat < val) "Stationary" else "NOT Stationary"
+    return(data.frame(
+      Type = t,
+      ADF_stat = round(stat, 3),
+      Tau_5pct = round(val, 3),
+      Result = result,
+      stringsAsFactors = FALSE
+    ))
+  })
+  table <- bind_rows(results)
+  print(table)
+}
+
+adf_test(spread, "Spread BTP/Bund")
+
+```
+
+The series is not stationary, so we need to differenciate it to use it in a VAR model.
+
+```{r}
+d_spread <- diff(spread) |> na.omit() # we loose the first observation due to differencing
+#d_train <- d_spread[1:n_train]
+#d_test  <- d_spread[(n_train + 1):nrow(d_spread)]
+
+#cat("\nTraining observations:", nrow(d_train))
+#cat("\nTest observations:", nrow(d_test))
+#cat("\nTrain period:", as.character(index(d_train)[1]), "->", as.character(index(d_train)[nrow(d_train)]))
+#cat("\nTest period:", as.character(index(d_test)[1]), "->", as.character(index(d_test)[nrow(d_test)]),"\n")
+```
+
+```{r}
+adf_test(d_spread, "Differenced spread BTP/Bund")
+```
+# now the train series is stationary
+
+```{r, echo=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+df_plot <- data.frame(date = index(d_spread), d_spread$spread)
+
+p <- ggplot(df_plot, aes(x = date, y = spread)) +
+geom_line() +
+geom_hline(yintercept = 0, color = "red") +
+labs(title = "Differenced Spread", y ="Basis Points", x = "") +
+theme_bw()
+
+print(p)
+```
+
+## Multicollinearity Test
+
+We now test for multicollinearity, so now we load the 2 other series.
+```{r}
+# ==========================================
+# PHASE 1: EXCEL DATA ACQUISITION & ALIGNMENT
+# ==========================================
+
+# Step 1: Load required libraries
+#install.packages("readxl")
+getwd()
+library(readxl)
+library(xts)
+library(zoo)
+
+# Importa l'indice VStoxx Europe Volatility
+
+vstoxx_raw <- read_excel("vstoxx_17_04.xlsx")
+vstoxx_raw <- vstoxx_raw[-1,]
+
+# 3. Trasforma in Serie Storica
+# Assumendo che la Colonna 1 sia la Data e la Colonna 3 sia il Tasso
+#estr_xts <- xts(as.numeric(estr_raw[[3]]), order.by = as.Date(estr_raw[[1]]))
+#colnames(estr_xts) <- "ESTR"
+#estr_clean <- na.remove(estr_xts)
+
+vstoxx_xts <- xts(as.numeric(vstoxx_raw[[2]]), order.by = as.Date(vstoxx_raw[[1]]))
+colnames(vstoxx_xts) <- "VStoxx"
+vstoxx_xts <- na.omit(vstoxx_xts)
+
+plot(vstoxx_xts, type="l")
+
+# ADF Test for vstoxx data
+adf.test(vstoxx_xts)
+# p-value = 0.01 -> Already stationary
+
+# Merge the datasets
+merged_data_2 <- merge(d_spread, vstoxx_xts, join = "inner")
+head(merged_data_2)
+
+clean_data_2 <- na.omit(merged_data_2)
+
+# =========================
+# 4. Split train/test 80/20
+# =========================
+ntest  <- round(nrow(clean_data_2) * 0.2)
+ntrain <- nrow(clean_data_2) - ntest
+
+train <- clean_data_2[1:ntrain, ]
+test  <- clean_data_2[(ntrain + 1):nrow(clean_data_2), ]
+
+cat("Training observations:", nrow(train), "\n")
+cat("Test observations:", nrow(test), "\n")
+cat("Train period:", as.character(index(train)[1]), "-", as.character(tail(index(train), 1)), "\n")
+cat("Test period:", as.character(index(test)[1]), "-", as.character(tail(index(test), 1)), "\n")
+
+
+```
+
+Now we should have a matrix with the d_spread value and the vstoxx index value, with matching data.
+We also have the train and test matrices.
+
+## MQ Test
+We have both series stationary, we now run the qm test to see if we need a VAR model.
+
+```{r}
+
+library(MTS)
+library(vars)
+
+# MQ test
+mq(train, lag=10)
+
+# We have all lags in which p-value is less than 0.05 ( equal to 0), so we can estimate a VAR model.
+```
+## VAR Model Estimation
+```{r}
+# 1. Determine optimal VAR lag length
+lag_selection <- VARselect(train, lag.max = 10, type = "const")
+lag_selection
+
+# We have optimal lag = 1 chosen by all the models
+library(vars)
+# Fit the model
+var_fit <- VAR(train, p = 2, type = "const")
+summary(var_fit)
+
+```
+## VAR Diagnostics
+
+```{r}
+
+# ==========================================
+# PHASE 4: VAR DIAGNOSTICS
+# ==========================================
+
+# 1. Test for leftover Serial Correlation (Portmanteau Test)
+# We test up to 10 lags to be safe. We want p-value > 0.05
+serial_test <- serial.test(var_fit, lags.pt = 10, type = "PT.asymptotic")
+cat("\n--- Serial Correlation Test ---\n")
+print(serial_test)
+
+# 2. Test for ARCH Effects (Volatility Clustering)
+# We want p-value < 0.05 to justify using DCC-GARCH next
+arch_test <- arch.test(var_fit, lags.multi = 5, multivariate.only = TRUE)
+cat("\n--- ARCH Effects Test ---\n")
+print(arch_test)
+
+## We need the DCC-GARCH model, as there are arch effects (p-value is near 0)
+
+```
+## DCC-GARCH Model
+
+```{r}
+# ==========================================
+# PHASE 5: THE DCC-GARCH MODEL
+# ==========================================
+library(rugarch)
+library(rmgarch)
+
+# 1. Extract the residuals from your fitted VAR model
+# The scale (* 100) is crucial! GARCH optimizers fail if the numbers are too tiny (e.g. 0.0001)
+var_residuals <- residuals(var_fit) * 100 
+
+# Convert the residuals back into a Time Series (xts) object for plotting later
+# We use the dates from diff_data, but remember the VAR loses the first 'p' rows
+# So we align the dates by tailing the diff_data
+var_residuals_xts <- xts(var_residuals, order.by = tail(index(train), nrow(var_residuals)))
+colnames(var_residuals_xts) <- c("Spread_Shock", "VStoxx_Shock")
+
+# 2. Specify the Univariate GARCH Models
+# Because the VAR already handled the mean, we set the ARMA order to (0,0) with NO mean!
+uspec <- ugarchspec(
+  mean.model = list(armaOrder = c(0, 0), include.mean = FALSE),
+  variance.model = list(garchOrder = c(1, 1), model = "sGARCH"),
+  distribution.model = "norm" # You can change to "std" (Student-t) if it fails to converge
+)
+
+# Replicate this specification for both of our variables
+mspec <- multispec(replicate(2, uspec))
+
+# 3. Specify the Multivariate DCC-GARCH model
+# We set VAR = FALSE because we ALREADY did the VAR manually and are feeding it the residuals!
+dcc_spec <- dccspec(
+  uspec = mspec, 
+  VAR = FALSE,
+  dccOrder = c(1, 1), 
+  distribution = "mvnorm"
+)
+
+# 4. Fit the DCC-GARCH model!
+# We feed it our scaled VAR residuals
+cat("\nFitting DCC-GARCH...\n")
+fit_dcc <- dccfit(dcc_spec, data = var_residuals_xts)
+
+# Print the final estimated model
+show(fit_dcc)
+
+# Dynamic conditional correlations over time
+dcc_corr <- rcor(fit_dcc)        # array: 2x2xT
+rho_t    <- dcc_corr[1,2,]       # time series of rho(BTP-Bund, VSTOXX)
+plot(rho_t, type = "l", main = "Dynamic Conditional Correlation")
+
+# Conditional volatilities
+vol <- sigma(fit_dcc)
+
+# DCC parameters (alpha + beta, should sum < 1)
+coef(fit_dcc)
+
+```
+```{r}
+library(xts)
+
+rho_t2 <- rcor(fit_dcc)[1, 2, ]
+resids <- residuals(var_fit)
+
+plot(zoo(rho_t2, order.by = index(resids)), type = "l",
+     main = "Dynamic Conditional Correlation: BTP-Bund vs VSTOXX",
+     ylab = "Correlation", xlab = "")
+abline(h = mean(rho_t2), col = "red", lty = 2)
+```
+
+## Model Diagnostics
+```{r}
+# 1. Model Diagnostics 
+# Standardized residuals should have no ARCH effects remaining
+infocriteria(fit_dcc)   # AIC, BIC
+plot(fit_dcc, which=1)           # rmgarch gives several diagnostic plots
+plot(fit_dcc, which=2)
+plot(fit_dcc, which=3)
+plot(fit_dcc, which=4)
+plot(fit_dcc, which=5)
+#colnames(var_fit$y)
+
+# 2. VAR Impulse Response Functions (IRFs)
+# This answers "how does the BTP-Bund spread respond to a VSTOXX shock?"
+library(vars)
+irf_result <- irf(var_fit, impulse = "VStoxx",
+                  response = "spread",
+                  n.ahead = 20, boot = TRUE)
+plot(irf_result)
+
+# 3. DCC-GARCH Volatility Forecast
+# A short-horizon forecast of conditional variances and correlations
+dcc_forecast <- dccforecast(fit_dcc, n.ahead = 20)
+plot(dcc_forecast, which=1)
+plot(dcc_forecast, which=2)
+plot(dcc_forecast, which=3)
+
+
+# Extract forecasted correlation
+rcor(dcc_forecast)
+
+# 4. Variance Decomposition (FEVD)
+# Tells you how much of the BTP-Bund spread variance is explained by VSTOXX shocks
+
+fevd_result <- fevd(var_fit, n.ahead = 20)
+plot(fevd_result)
+```
+
+## Forecast
+```{r}
+
+# Re-fit with out.sample to enable rolling forecast
+dcc_fit2 <- dccfit(dcc_spec, data = resids,
+                   out.sample = 100)   # hold out last 100 obs
+
+# 1. Unconditional n-ahead forecast
+dcc_fore <- dccforecast(dcc_fit2, n.ahead = 20)
+
+# Forecasted correlation
+rcor(dcc_fore)   # 2x2xT array
+
+# Forecasted volatilities
+sigma(dcc_fore)
+
+# 2. Rolling 1-step-ahead forecast (more meaningful for evaluation)
+dcc_roll <- dccforecast(dcc_fit2, n.ahead = 1, n.roll = 99)
+rcor(dcc_roll)
+
+# 1-Step Ahead Forecast with VAR
+library(vars)
+
+# Forecast 1 step ahead (next trading day)
+var_forecast <- predict(var_fit, n.ahead = 1, ci = 0.95)
+
+# Print the forecast
+print(var_forecast)
+
+last_spread <- tail(spread, 1)
+forecast_level <- last_spread + var_forecast$fcst$spread[1, "fcst"]
+forecast_level
+
+```
+## Test the model
+We now use the test portion of our data, to see the accuracy of our training model
+
+```{r}
+
+library(vars)
+library(xts)
+library(ggplot2)
+
+# =========================
+# Test set: rolling 1-step-ahead out-of-sample forecast
+# =========================
+
+train_multi <- train
+test_multi  <- test
+
+# 1. Selezione lag ottimale sul train
+lag_sel <- VARselect(train_multi, lag.max = 10, type = "const")
+p_opt <- as.numeric(lag_sel$selection["AIC(n)"])
+
+cat("Optimal lag selected on train:", p_opt, "\n")
+
+# 2. Rolling 1-step-ahead forecast sulla serie differenziata "spread"
+n_test <- nrow(test_multi)
+
+fc_dspread <- numeric(n_test)
+real_dspread <- as.numeric(test_multi[, "spread"])
+
+# Among the candidate rolling window sizes, 200 observations produced the lowest out-of-sample forecast error and  # the most plausible final spread estimate, therefore it was selected as the preferred specification.
+window_size <- 250
+
+for (i in 1:n_test) {
+
+  if (i == 1) {
+    available_data <- train_multi
+  } else {
+    available_data <- rbind(train_multi, test_multi[1:(i - 1), ])
+  }
+
+  if (nrow(available_data) > window_size) {
+    current_train <- available_data[(nrow(available_data) - window_size + 1):nrow(available_data), ]
+  } else {
+    current_train <- available_data
+  }
+
+  var_roll <- VAR(current_train, p = p_opt, type = "const")
+  pred_1 <- predict(var_roll, n.ahead = 1, ci = 0.95)
+
+  fc_dspread[i] <- as.numeric(pred_1$fcst$spread[1, "fcst"])
+}
+
+
+# 3. Date del test
+test_dates <- index(test_multi)
+
+# 4. Ricostruzione dello spread in livelli
+# ultimo valore osservato in livelli prima dell'inizio del test
+test_start_date <- test_dates[1]
+pos_test_start <- which(index(spread) == test_start_date)
+last_level_before_test <- as.numeric(spread[pos_test_start - 1])
+
+# forecast in livelli
+fc_level <- last_level_before_test + cumsum(fc_dspread)
+
+# valori reali in livelli
+real_level <- as.numeric(spread[test_dates])
+
+# 5. Data frame finale
+df_roll <- data.frame(
+  Date = as.Date(test_dates),
+  RealSpread = real_level,
+  ForecastSpread = fc_level,
+  RealDiff = real_dspread,
+  ForecastDiff = fc_dspread
+)
+
+# 6. Grafico livelli
+ggplot(df_roll, aes(x = Date)) +
+  geom_line(aes(y = RealSpread, color = "Real spread"), linewidth = 1) +
+  geom_line(aes(y = ForecastSpread, color = "Rolling forecast"),
+            linewidth = 1, linetype = "dashed") +
+  labs(
+    title = "Rolling 1-Step-Ahead VAR Forecast vs Real Spread",
+    y = "Spread (bps)",
+    x = "Date",
+    color = "Legend"
+  ) +
+  theme_bw()
+
+# 7. Metriche sui livelli
+err_level <- df_roll$RealSpread - df_roll$ForecastSpread
+
+mae_level <- mean(abs(err_level), na.rm = TRUE)
+rmse_level <- sqrt(mean(err_level^2, na.rm = TRUE))
+
+cat("MAE levels:", round(mae_level, 4), "\n")
+cat("RMSE levels:", round(rmse_level, 4), "\n")
+
+# 8. Benchmark naive
+naive_fc_level <- rep(last_level_before_test, length(fc_level))
+
+mae_naive <- mean(abs(real_level - naive_fc_level), na.rm = TRUE)
+rmse_naive <- sqrt(mean((real_level - naive_fc_level)^2, na.rm = TRUE))
+
+cat("Naive MAE:", round(mae_naive, 4), "\n")
+cat("Naive RMSE:", round(rmse_naive, 4), "\n")
+
+# 9. Valore finale out-of-sample 1-step-ahead
+final_forecast_date <- tail(test_dates, 1)
+final_forecast_diff <- tail(fc_dspread, 1)
+final_forecast_level <- tail(fc_level, 1)
+
+cat("Final forecast date:", as.character(final_forecast_date), "\n")
+cat("Final out-of-sample 1-step forecast (diff):", round(final_forecast_diff, 4), "\n")
+cat("Final out-of-sample 1-step forecast (level):", round(final_forecast_level, 4), "\n")
+
+
+
+
+
+```
+
+
+
+
