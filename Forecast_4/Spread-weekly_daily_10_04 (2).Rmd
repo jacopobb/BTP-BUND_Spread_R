@@ -1,0 +1,2060 @@
+---
+title: "Spread"
+output:
+  html_document: default
+  pdf_document: default
+date: "2026-03-19"
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# SPREAD
+
+## 1. Data setup
+
+```{r setup, include=FALSE}
+getwd()
+library(urca)
+library(tseries)
+library(quantmod)
+library(forecast)
+library(rugarch)
+library(FinTS)
+library(ggplot2)
+library(dplyr)
+library(httpgd)
+library(R.utils)
+library(xts)
+library(readxl)
+library(fBasics)
+library(lmtest)
+library(sandwich)
+library(fUnitRoots)
+library(stats)
+library(graphics)
+library(MTS)
+library(MASS)
+library(zoo)
+library(forecast)
+library(seastests)
+library(strucchange)
+
+
+```
+
+```{r, eval=FALSE}
+# ============================================================
+# MACOS OPTIMIZATION BLOCK (Apple Silicon)
+# ============================================================
+
+# 1. Verifica che R sia nativo ARM64 (non Rosetta 2)
+if (R.version$arch != "aarch64") {
+  warning("R non sta girando su ARM64. Reinstalla R nativo per Apple Silicon da cran.r-project.org")
+} else {
+  message("✓ R ARM64 nativo confermato: ", R.version$arch)
+}
+
+# 2. Configura parallelismo ottimale per macOS (usa FORK, molto più veloce di SOCKET)
+library(parallel)
+N_CORES <- detectCores(logical = FALSE) - 1  # core fisici, lascia 1 libero
+message("✓ Core disponibili per parallelismo: ", N_CORES)
+
+# 3. RNG riproducibile per simulazioni parallele
+RNGkind("L'Ecuyer-CMRG")
+set.seed(42)
+
+# 4. Funzione helper: crea cluster FORK (macOS only)
+make_mac_cluster <- function() {
+  makeCluster(N_CORES, type = "FORK")  # FORK evita di riesportare variabili
+}
+
+# 5. Libera memoria dopo operazioni pesanti
+gc_after <- function(expr) {
+  result <- force(expr)
+  gc(verbose = FALSE)
+  result
+}
+
+message("✓ Blocco ottimizzazione macOS caricato.")
+# ============================================================
+
+```
+Load the data and parse from excel file, weekly spread.
+
+```{r, include=FALSE}
+rm(list= ls())
+getwd()
+#setwd("~/Desktop")
+data <- read_excel("Spread_daily_10_04.xlsx")
+data <- na.omit(data)
+# Cambia segno solo se la media è negativa
+data$`IT10DE10=TWEB (BID)` <- as.numeric(data$`IT10DE10=TWEB (BID)`) * -1
+data$Date <- as.Date(data$Date)
+spread <- zoo(data$`IT10DE10=TWEB (BID)`, order.by = data$Date)
+```
+
+Inspect data
+
+```{r}
+head(data)
+str(data)
+sum(is.na(data))
+any(is.infinite(spread))
+```
+
+Plot the data
+
+```{r,echo=FALSE}
+plot(spread, main="BTP-BUND Spread (Daily)", ylab="Spread (bps)", xlab= "Date")
+```
+
+```{r, echo=FALSE}
+options(scipen = 999)
+basicStats(spread)
+```
+
+The descriptive analysis of the daily BTP-BUND spread reveals a distribution with a mean of 141.05 bps and a median of 134.65 bps. The fact that the mean remains above the median confirms a persistent positive skewness, indicating that the distribution is influenced by periodic upward shocks rather than frequent downward drops.
+
+Visual inspection of the daily time series identifies three distinct market regimes:
+
+The 2022 Surge: A sharp escalation where the spread moved from its minimum of 59.80 bps toward the series maximum of 250.70 bps, likely reflecting heightened political or macroeconomic uncertainty.
+
+The 2023–2024 Volatility: A period of consolidation characterized by significant fluctuations, yet largely contained within the interquartile range of 105.50 bps to 179.03 bps.
+
+The 2025–2026 Mean Reversion: A sustained downward trend where the spread compressed significantly, approaching the lower bounds of the sample before a slight uptick at the end of the period.
+
+Econometrically, the daily frequency highlights the "jump-diffusion" nature of sovereign spreads. While the market spends the majority of its time in a state of relative calm—as evidenced by the median and the 1st quartile of 105.50 bps—it remains susceptible to rapid "tail risk" events. These episodes of stress pull the mean upward, creating the characteristic right-skewed profile typical of risk-sensitive financial instruments.
+
+**Forecast n°1 : naive forecast (mean)**
+
+```{r, include=FALSE}
+mean <- mean(data$`IT10DE10=TWEB (BID)`, na.rm=TRUE)
+```
+
+```{r, echo=FALSE}
+plot(spread, main="BTP-BUND Spread (Weekly", ylab="Spread (bps)", xlab= "Date")
+abline(h = mean, col="red", lwd=2, lty=2)
+text(x = start(spread), y= mean,
+     labels=paste("Mean =", round(mean, 2)),
+     col="red", adj= c(0, -0.5))
+```
+
+## 2. Test for seasonality
+
+We use seastests package
+
+```{r}
+start_date<- index(spread)[1]
+library(lubridate)
+start_year<-year(start_date)
+start_month<-month(start_date)
+start_day <-day(start_date)
+spread_ts <- ts(data$`IT10DE10=TWEB (BID)`, start=c(start_year,start_month,start_day), frequency = 252)#annual frequency
+isSeasonal(spread_ts, test="combined")
+#We get FALSE
+
+#Individual tests
+isSeasonal(spread_ts, test="qs")
+isSeasonal(spread_ts, test="seasdum")
+isSeasonal(spread_ts, test="kw")
+isSeasonal(spread_ts, test="fried")
+
+#We get all FALSE
+
+## Now plot ACF and PACF
+Acf(spread_ts, lag.max= 52)
+Pacf(spread_ts, lag.max = 52)
+
+#We have 1 significant lag at 1 in the Pacf, and a Acf which gradually goes to 0
+#This suggests no seasonality.
+
+#Last point, let's fit an arima model
+
+adf.test(spread_ts)     # stationarity test -> we have p-value = 0.546, so we fail to reject the null, so we are in the null workspace, this means no seasonality.
+
+kpss.test(spread_ts) # stationarity test where the null hypothesis is that the series IS stationary
+# p-value is 0.01 -> we REJECT the null, so the series is NOT stationary
+
+```
+
+## Visualization for the no-seasonality
+
+```{r seasonal_analysis, echo=FALSE}
+
+# 1. Seasonal Plot 
+# Mostra l'andamento dello spread sovrapponendo i periodi (2021-2026)
+ggseasonplot(spread_ts, year.labels = TRUE, year.labels.left = TRUE) +
+  theme_minimal() +
+  labs(title = "Seasonal Effect: BTP-BUND (Annual Pattern)",
+       subtitle = "Daily data (2021-2026) - Annual Cycle",
+       x = "Day of the Year (Trading Days)",
+       y = "Spread (bps)",
+       color = "Year")
+
+# 2. Subseries Plot (Medie Mensili)
+# Nota: Con freq = 252, il subseries plot potrebbe tentare di fare 252 piccoli grafici.
+# Per vedere le medie mensili "storiche", è meglio aggregare prima i dati o 
+# usare una frequenza mensile (12) se l'obiettivo è l'analisi macro.
+# Se vuoi comunque il subseries sulle 52 settimane:
+#spread_weekly_avg <- aggregate(spread_ts, nfrequency = 52)
+ggsubseriesplot(spread_ts) +
+  theme_minimal() +
+  labs(title = "Subseries Plot: Daily data",
+       subtitle = " 2021-2026",
+       x = "Week of the Year",
+       y = "Spread (bps)")
+
+# 3. STL Decomposition (Multi-Year)
+# Utilizziamo un s.window ampio per catturare la stagionalità annuale
+decomposed <- stl(spread_ts, s.window = "periodic", robust = TRUE)
+
+autoplot(decomposed) +
+  theme_minimal() +
+  labs(title = "STL Decomposition (2021-2026)",
+       subtitle = "Trend, Annual Seasonality, and Daily Remainder")
+```
+
+-->Seasonal and Subseries Plot Interpretation
+The seasonal plots further investigate whether specific times of the year are inherently riskier for the Italian spread:
+
+Subseries Plot (Weekly): The blue dashed lines represent the historical mean for each specific week of the year across the 2021-2026 period. The relatively flat nature of these mean lines suggests that there is no "structural" week of the year where the spread is consistently higher. The high density of the black vertical lines reflects the daily volatility within those weeks.
+
+Annual Pattern (Seasonal Plot): By overlaying the years, we can see that the 2022-2024 period significantly outperformed the historical averages, creating the "Surge" identified in the descriptive statistics. The 2025-2026 lines are positioned lower, confirming the transition into a period of market calm.
+
+-->The STL (Seasonal and Trend decomposition using Loess) plot provides a granular look at the forces driving the spread:
+
+Trend: The trend component shows a steady appreciation starting in 2021, reaching a peak during the 2024-2025 period. Notably, toward the beginning of 2026, the trend exhibits a clear mean-reversion phase, with the spread beginning to compress. This suggests that long-term macroeconomic factors were the primary drivers of the spread's expansion and subsequent cooling.
+
+Seasonal: The annual seasonal component is present but relatively low in magnitude (oscillating between -10 and +15 bps). This indicates that while there are minor "calendar effects," they are secondary to the overall trend and unpredictable market shocks.
+
+Remainder: This component represents "noise" or exogenous shocks. We observe significant density and volatility in the remainder during the 2024-2025 period. These spikes represent "tail risk" events—sudden political or financial news that caused the spread to jump independently of any seasonal or long-term trend.
+
+**Econometric Summary**
+From an econometric perspective, the BTP-BUND spread during this period is a trend-dominated series. The influence of seasonality is statistically marginal compared to the impact of the Remainder (shocks). This confirms that the spread is more sensitive to "news arrival" and discretionary policy changes than to cyclical or seasonal time-effects.
+
+## 3. Model Specification: Levels vs. Logarithmic Transformations\*\*
+
+A critical decision in modelling the BTP-BUND spread involves the choice
+between raw levels (basis points) and logarithmic transformations. While
+log-returns are standard for equity prices to ensure normality and
+constant variance, this study follows the established econometric
+literature—notably **Campbell, Lo, and MacKinlay (1997)** and **Hamilton
+(1994)**—by analyzing the spread in **levels**.
+
+As argued by **Engle (1982)** in his seminal work on ARCH models,
+interest rate differentials are already expressed in percentage terms;
+therefore, a log-transformation is not only redundant but can lead to
+significant numerical instability as values approach the **Zero Lower
+Bound (ZLB)**. Maintaining the analysis in basis points ensures the
+direct economic interpretability of the results, which is essential for
+assessing credit and liquidity risk premiums.
+
+#### Literature Review on Model Specification
+
+The choice to model the BTP-BUND spread in first differences of its
+levels is supported by the foundational empirical work on Eurozone
+sovereign risk. **Codogno, Favero, and Missale (2003)** and **Favero et
+al. (2010)** demonstrate that interest rate differentials are best
+captured in basis points to maintain linear properties between credit
+risk and liquidity factors. Furthermore, the application of a **GARCH
+framework**, as pioneered by **Bollerslev (1986)**, ensures that the
+time-varying volatility of the spread is explicitly parameterized rather
+than suppressed via logarithmic transformations.
+
+### 3.1 Data Partitioning: Training and Test Sets
+
+To evaluate the predictive performance of the **ARIMA model**, the
+dataset is partitioned into training and testing subsets. The training
+phase utilizes a **rolling window approach** with a fixed length of 10
+years, corresponding to **520 weekly observations**.
+
+This specific configuration ensures that the model is estimated on a
+sufficiently long historical period while remaining sensitive to more
+recent structural dynamics in the BTP-BUND spread. The architecture of
+the script is designed for **parametric flexibility**: the training
+window duration can be easily modified by adjusting the
+`$n_train_window$` constant (e.g., replacing 520 with a different value)
+to test the model's robustness across different look-back periods.
+
+```{r}
+n_test <- length(spread)*0.2
+n_train_window <- length(spread)-n_test 
+
+# Lunghezza totale della serie differenziata
+total_obs <- length(spread)
+
+# 1. Definizione degli indici per il TEST (le ultime 10)
+test_start <- total_obs - n_test + 1
+test_end   <- total_obs
+test       <- spread[test_start:test_end]
+
+# 2. Definizione degli indici per il TRAIN (i 10 anni precedenti al test)
+# Il train deve finire esattamente dove inizia il test
+train_end   <- test_start - 1
+train_start <- train_end - n_train_window + 1
+
+# Estrazione del train
+train<- spread[train_start:train_end]
+
+# Verifica coerenza
+print(paste("Lunghezza Train:", length(train))) # Deve essere 520
+print(paste("Lunghezza Test:", length(test)))       # Deve essere 10
+# Creiamo un piccolo data frame per il plot
+df_plot <- data.frame(
+  Settimana = 1:length(spread),
+  Valore = as.numeric(spread)
+)
+ggplot(df_plot, aes(x = Settimana, y = Valore)) +geom_line(color = "steelblue") +
+geom_vline(xintercept = length(train), color = "red", linetype = "dashed",
+linewidth = 1) +labs(title = "BTP-BUND Spread: Training vs Test Set",subtitle = paste("Punto di taglio all'osservazione:", length(train)),
+    x = "Settimane",y = "Variazione Spread (bps)")+theme_minimal()
+
+cat(sprintf("Training observations: %d\n", length(train)))
+cat(sprintf("Test observations:     %d\n", length(test)))
+cat(sprintf("Train period: %s -> %s\n", index(train)[1], index(train)[length(train)]))
+cat(sprintf("Test period:  %s -> %s\n", index(test)[1],  index(test)[length(test)]))
+```
+
+### 3.3 Stationarity and Unit Root Testing
+
+To ensure the statistical validity of the ARIMA-GARCH framework, we
+first evaluate the integration order of the series. Financial variables
+often exhibit non-stationary behavior, characterized by a "random walk".
+
+#### 3.3.1 Augmented Dickey-Fuller (ADF) Test
+
+We perform the ADF test to check for the presence of a unit root
+($H_0$).
+
+```{r}
+par(mfrow = c(1, 2))
+acf(as.numeric(train))
+Pacf(as.numeric(train))
+par(mfrow = c(1, 1)) 
+```
+
+### 3.4 Persistence and Autocorrelation Analysis
+
+The initial inspection of the **Autocorrelation Function (ACF)** reveals
+a very slow, near-linear decay. In time series econometrics, this
+pattern is a classic diagnostic for a **"near-unit root"** process,
+indicating that the AR component is highly persistent and the series is
+likely non-stationary.
+
+Regarding the optimal number of lags for the model, while empirical
+rules of thumb exist, this study adopts an **automated selection
+procedure** based on the minimization of Information Criteria,
+specifically the **Akaike Information Criterion (AIC)** and the
+**Bayesian Information Criterion (BIC)**. This approach ensures an
+optimal balance between model fit and parsimony, mitigating the risks of
+both underfitting (omitted variable bias) and overfitting (inflated
+variance).
+
+### 3.5 Formal Stationarity Testing: The ADF Approach
+
+To rigorously confirm the integration order of the BTP-BUND spread, we
+employ the **Augmented Dickey-Fuller (ADF) test** using the `ur.df()`
+function from the `urca` package. Unlike standard implementations, this
+approach requires a direct comparison between the calculated test
+statistics ($\tau$) and the critical values provided by **Dickey and
+Fuller (1979)**.
+
+#### 3.5.1 Test Specification and Hypotheses
+
+The test is conducted following a hierarchical strategy, accounting for
+different deterministic components:
+
+1.  Trend (`type = "trend"`): To check if the series is stationary
+    around a deterministic time trend.
+
+2.  Drift (`type = "drift"`): To test for stationarity around a constant
+    non-zero mean (most appropriate for interest rate spreads).
+
+3.  None (`type = "none"`): To test for stationarity around zero.
+
+#### 3.5.2 Decision Rule
+
+For the `ur.df()` output, we focus on the **tau statistic (**$\tau$).
+The null hypothesis ($H_0$) of a unit root is rejected only if the test
+statistic is **more negative** (i.e., lies in the lower tail) than the
+critical value at the 5% significance level.
+
+If the series in levels is found to be non-stationary, we proceed with
+**first-differencing** ($\Delta \text{Spread}_t$) and re-apply the test.
+The transformation is considered successful only when the tau statistic
+for the differenced series falls significantly below the critical
+threshold, confirming that the process is $I(1)$ and ready for GARCH
+modelling.
+
+```{r}
+risultato_adf <- adfTest(train, lags = 1, type = "c")
+print(risultato_adf)
+# Equivalent with auto determination of lags
+
+test_adf_completo <- function(serie, nome_serie = "Serie") {
+  
+  cat("\n==============================================\n")
+  cat("ANALISI STAZIONARIETÀ (ADF):", nome_serie, "\n")
+  cat("==============================================\n")
+  
+  # Definiamo i tre tipi di test ADF
+  # "none"  = senza costante né trend
+  # "drift" = con costante (intercetta)
+  # "trend" = con costante e trend temporale
+  tipi <- c("none", "drift", "trend")
+  
+  risultati_lista <- lapply(tipi, function(t) {
+    # Eseguiamo il test con selezione automatica dei lag tramite AIC
+    test <- ur.df(serie, type = t, selectlags = "AIC")
+    
+    # Estraiamo la statistica del test e il valore critico al 5%
+    statistica <- test@teststat[1]
+    valore_critico <- test@cval[1, "5pct"]
+    
+    # Verifichiamo la stazionarietà (statistica < valore critico)
+    esito <- if (statistica < valore_critico) "STAZIONARIA" else "NON STAZIONARIA"
+    
+    return(data.frame(
+      Modello = t,
+      Statistica_ADF = round(statistica, 3),
+      Valore_Critico_5pct = round(valore_critico, 3),
+      Risultato = esito,
+      stringsAsFactors = FALSE
+    ))
+  })
+  
+  # Uniamo i risultati in una tabella leggibile
+  tabella_finale <- bind_rows(risultati_lista)
+  print(tabella_finale)
+  
+  return(tabella_finale)
+}
+# --- COME USARLA ---
+
+# 1. Test sullo spread originale (livelli)
+risultati_livelli <- test_adf_completo(train, "Spread BTP/Bund (Livelli)")
+```
+
+###3.6 Transformation and Diagnostic of Differenced Series Following the
+identification of a unit root in the levels of the spread, we proceed
+with **first-differencing** to achieve stationarity, transforming the
+series into an $I(0)$ process. This transformation represents the weekly
+change in the BTP-BUND spread (measured in basis points).
+
+To detect the presence of **Conditional Heteroskedasticity**—a
+fundamental requirement for GARCH modelling—we analyze the
+Autocorrelation Function (ACF) and Partial Autocorrelation Function
+(PACF) of both the differenced series and its squared values. While the
+standard ACF/PACF help identify the $ARMA$ structure for the mean
+equation, the squared series analysis is crucial to identify
+**volatility clustering**, where large shocks tend to be followed by
+other large shocks, regardless of their sign."
+
+```{r}
+# 1. Calcolo della differenza prima (Weekly Change)
+dspread <- diff(spread)
+dtrain <- dspread[train_start:train_end]
+dtest  <- dspread[test_start:test_end]
+
+# 2. Controllo rapido delle dimensioni (per sicurezza)
+cat("Lunghezza Train:", length(dtrain), "(4 anni )\n")
+cat("Lunghezza Test:", length(dtest), "(1 anno)\n")
+
+# 3. Verifica se ci sono NA (fondamentale prima del GARCH)
+if(any(is.na(dtrain))) {
+  d_train <- na.omit(dtrain)
+  cat("Attenzione: Rimossi valori NA dal train\n")
+}
+```
+
+**3.6.1 Identification of the Mean and Variance Equations**
+
+## 4.4. Autocorrelation Analysis of the Differenced Spread
+
+The diagnostic plots for the differenced spread ($\Delta \text{Spread}_t$) provide several key insights into the identification of the mean equation:
+
+* **ACF and PACF of the Differenced Series:** the **ACF and PACF of the daily differenced spread** show that the first-order lags (Lag 1) are now **statistically insignificant**, as they fall entirely within the 95% confidence intervals (represented by the blue dashed lines). 
+* **Market Efficiency:** This lack of immediate autocorrelation suggests that daily changes in the BTP-BUND spread follow a process close to **White Noise**. Econometrically, this implies that the series behaves as a **Random Walk**, where the best predictor for tomorrow's spread is simply today's value, and daily innovations are largely unpredictable.
+* **Higher-Order Lags:** While isolated spikes appear at **Lag 12** and **Lag 18**, they do not correspond to standard financial cycles (such as a 5-day business week or a 21-day monthly effect). 
+
+Following the principle of **parsimony**, these higher-order spikes are deemed statistically borderline and likely represent **noise-driven artifacts**. We exclude them to avoid **overfitting** and to ensure model stability, as including $AR(18)$ or $MA(12)$ terms would lack a clear economic or theoretical justification for daily price changes.
+
+### Conclusion for Model Identification
+The diagnostic evidence confirms that the "memory" of the spread is captured almost entirely by the **integration ($d=1$)** of the series. The absence of a clear $AR$ or $MA$ pattern in the early lags indicates that the residuals are now ready for the next stage of analysis: testing for **Heteroskedasticity (ARCH effects)** in the squared residuals to model volatility clustering.
+
+### Summary Table: ACF/PACF Diagnostics
+
+| Lag | Significance | Interpretation |
+| :--- | :--- | :--- |
+| **Lag 1** | **Insignificant** | No immediate momentum or mean-reversion effect. |
+| **Lags 2–10** | **Insignificant** | High market efficiency; no short-term memory. |
+| **Lags 12 & 18** | **Significant** | Likely spurious noise; excluded to maintain parsimony. |
+| **Overall Result** | **White Noise** | The differenced series is suitable for volatility modeling. |
+
+## 4.5. Analysis of Volatility Clustering (Squared Residuals)
+
+The diagnostic plots for the **squared differenced spread** ($\Delta \text{Spread}_t^2$) provide conclusive evidence regarding the variance structure of the series:
+
+* **ACF and PACF of Squared Differenced Spread:** In stark contrast to the linear series, the squared residuals exhibit **highly significant spikes** across multiple lags (specifically Lags 1, 2, 4, 5, and 6). These spikes far exceed the 95% confidence intervals, indicating strong serial correlation in the second moments of the distribution.
+* **Volatility Clustering:** This pattern is a classic indicator of **volatility clustering**, where periods of high variance are followed by high variance, and calm periods are followed by calm. Econometrically, this confirms that the error terms are not independently and identically distributed (i.i.d.) but follow a conditional heteroskedastic process.
+* **ARCH Effects:** The presence of these significant lags suggests that a simple ARIMA model is insufficient to capture the risk dynamics of the spread. The "memory" in the squared returns necessitates the formal testing of **ARCH (Autoregressive Conditional Heteroskedasticity)** effects.
+
+### Conclusion for Model Selection
+The evidence of strong autocorrelation in the squared innovations justifies the transition from a linear time-series model to a **GARCH-family model**. This will allow for the simultaneous modeling of the conditional mean (identified as a Random Walk in the previous step) and the time-varying conditional variance, accurately capturing the "fat tails" and risk bursts observed in the BTP-BUND daily data.
+
+### Summary Table: Squared Residuals Diagnostics
+
+| Metric | Observation | Econometric Implication |
+| :--- | :--- | :--- |
+| **Squared ACF Lags** | Multiple significant spikes (1-6+) | Clear presence of ARCH effects. |
+| **Squared PACF Lags** | Significant initial spikes | Suggests a GARCH(1,1) or GARCH(2,1) candidate. |
+| **Volatility Structure** | Non-constant over time | Heteroskedasticity must be modeled. |
+| **Final Strategy** | **GARCH Modeling** | Necessary to estimate time-varying risk. |
+Finally, regarding the **intercept of the mean equation**, a $t$-test
+was performed to determine if the mean of the differenced series is
+significantly different from zero. If the $p$-value is below 0.05, it
+implies the presence of a significant **drift** component, which will be
+incorporated into the $ARMA$ specification via the `include.mean = TRUE`
+parameter. If the mean is statistically zero, the spread exhibits a pure
+random walk behavior without a deterministic trend.
+
+```{r, fig.width=12, fig.height=10, out.width="100%"}
+par(mfrow = c(4, 1), mar = c(3, 4, 3, 2))
+Acf(as.numeric(dtrain), lag.max = 30, main = "ACF of Diff Spread")
+Pacf(as.numeric(dtrain), lag.max = 30, main = "PACF of Diff Spread")
+Acf(as.numeric(dtrain)^2, lag.max = 30, main = "ACF of Squared Diff Spread")
+Pacf(as.numeric(dtrain)^2, lag.max = 30, main = "PACF of Squared Diff Spread")
+par(mfrow = c(1, 1))
+```
+
+```{r}
+
+t.test(dtrain)
+```
+
+The $t$-test results indicate that the mean of the differenced series is
+not statistically different from zero ($p$-value $> 0.05$).
+
+##3.7 Formal Stationarity Testing on First Differences To confirm the
+achievement of stationarity, we re-apply the Augmented Dickey-Fuller
+(ADF) test. Given that the previous $t$-test confirmed a zero mean for
+the differenced series, we utilize the "none" specification (type =
+"none").Econometrically, this is a robust choice: if the spread in
+levels exhibited a trend, the first difference would show a constant
+drift. If we were to assume a trend in the differences, it would imply
+that the spread is not just increasing, but accelerating—a scenario that
+lacks long-term economic equilibrium. In financial theory, interest rate
+spreads are considered "mean-reverting" and anchored to macroeconomic
+fundamentals. ###3.7.1 Theoretical Framework: Key Literature This
+modeling approach is supported by three foundational works:Vasicek
+(1977): Introduced the mathematical framework for mean-reversion. It
+justifies the exclusion of a trend in the ADF test, as rates are pulled
+back toward a long-term equilibrium.Cox, Ingersoll, & Ross (1985):
+Established that volatility is conditional on the level of the interest
+rate, providing the theoretical predecessor to GARCH modeling.Balduzzi,
+Das, & Foresi (1998): Analyzed the "Central Tendency" of bond yields,
+supporting the idea that spreads oscillate around a fundamental mean.
+
+```{r}
+test_stationarity_diff<-adfTest(dtrain,lags=1,type="nc")
+print(test_stationarity_diff)
+#equivalent but with auto determination of lags
+test_autolag <- ur.df(dtrain, type = "none", selectlags = "AIC")
+summary(test_autolag)
+stat_test <- test_autolag@teststat[1]
+valore_critico_5pct <- test_autolag@cval[1, "5pct"]
+
+# 3. Verifica automatica con messaggio
+cat("\n--- VERIFICA RISULTATO ADF (Type = None) ---\n")
+cat("Statistica del Test:", round(stat_test, 4), "\n")
+cat("Valore Critico (5%):", valore_critico_5pct, "\n")
+
+if (stat_test < valore_critico_5pct) {
+  cat("ESITO: La serie è STAZIONARIA (p-value < 0.05)\n")
+  cat("Significato: Puoi procedere con il modello GARCH.\n")
+} else {
+  cat("ESITO: La serie NON è STAZIONARIA\n")
+  cat("Attenzione: Potrebbe esserci ancora una radice unitaria.\n")
+}
+```
+
+The Verdict:\
+We reject null hypotesysi of non stationarity
+
+##3.8 Seasonality and ARCH Diagnostics Before finalizing the model
+specification, we perform a definitive check for residual seasonality
+and ARCH effects.
+
+###3.8.1 Power Spectrum and Seasonality Tests The Periodogram is
+utilized to analyze frequency strength. A pronounced peak at a specific
+frequency  would indicate
+a periodic component. Furthermore, we apply the seastests package for a
+combined formal verification.
+
+```{r}
+# Calcola lo spettro di potenza
+?spec.pgram
+spec_raw <- spec.pgram(as.numeric(dtrain), spans = c(3,3), taper = 0.1, plot = TRUE,log='no')
+# Trova la frequenza con il picco massimo
+max_freq <- spec_raw$freq[which.max(spec_raw$spec)]
+periodo_dominante <- 1 / max_freq
+cat(periodo_dominante)
+```
+
+### 4.6. Spectral Analysis Interpretation
+
+The **Smoothed Periodogram** analysis provides a frequency-domain perspective that complements the previous time-series diagnostics:
+
+* **Frequency Distribution:** The spectrum shows multiple significant peaks rather than a single dominant frequency. This confirms that the BTP-BUND spread is a **multi-cyclical series** where seasonality is fragmented across different time horizons.
+* **Short-term Dynamics:** The prominent peaks at higher frequencies (e.g., near 0.4) represent the daily "noise" and short-term volatility. This aligns with the **Maximum value of 250.70 bps**, indicating that sharp, short-lived shocks are a structural feature of the spread's behavior.
+* **Low-Frequency Persistence:** The power concentrated near the origin (frequency → 0) represents the **Trend component**. This captures the long-term shifts (2022 surge and 2025 reversion) which, despite the daily noise, remain the most powerful drivers of the spread's variance.
+
+**Conclusion:** The spectral density confirms that while no simple seasonal rule can predict the spread, the series is far from being pure white noise. The complexity of the periodogram justifies the use of non-linear models (like GARCH) to capture the clusters of energy (volatility) that appear at various frequencies.
+
+Frequenza (s),Periodo Temporale,Obiettivo dell'analisi
+5,Settimanale,Verificare pattern intra-settimanali (Trading week).
+21,Mensile,Catturare la stagionalità legata ai calendari macroeconomici.
+63,Trimestrale,Analizzare l'impatto dei report trimestrali e scadenze tecniche.
+252,Annuale,Confermare il pattern stagionale legato alle manovre di bilancio annuali.
+```{r}
+
+autoplot(dspread)
+
+#To use this method, we need a ts object, let's create one
+dspread_ts <- ts(dtrain, start=c(start_year,start_month,start_day), frequency = 21)#try also with 12
+ggseasonplot(dspread_ts)
+
+ggsubseriesplot(dspread_ts)
+
+#Look also at decomposed series
+decomposed <- stl(dspread_ts, s.window="periodic")
+autoplot(decomposed)
+```
+--> STL Decomposition of the Differenced Series
+### 1. STL Decomposition at Monthly Resolution
+The decomposition of the BTP-BUND spread at a 21-day frequency reveals a highly active cyclical structure:
+
+* **Trend:** The trend component remains the primary driver, capturing the broad expansion of the spread from 2021 through 2024 and the subsequent compression toward 2026. At this frequency, the trend is more reactive to mid-term economic shifts compared to the annual model ($f=252$).
+* **Seasonal (Monthly):** The seasonal panel displays a persistent, high-frequency oscillation. However, the amplitude is notably small, ranging between **-1 and +1.5 bps**. This suggests that while a monthly cycle exists, its statistical contribution to the total variance is marginal.(Se il tuo spread medio è di 150 bps e la volatilità giornaliera (Remainder) ha picchi di 10-20 bps, un'oscillazione di soli 3 bps è considerata trascurabile (noise-level).)
+* **Remainder:** The remainder component continues to exhibit significant "bursts" or clusters of volatility. This indicates that sudden market news (stochastic shocks) has a much larger impact on daily spread changes than any predictable monthly calendar effect.
+
+
+
+We use seastests package
+
+```{r}
+#install.packages("seastests")
+
+isSeasonal(dspread_ts, test="combined")
+#We get FALSE
+
+#Individual tests
+isSeasonal(dspread_ts, test="qs")
+isSeasonal(dspread_ts, test="seasdum")
+isSeasonal(dspread_ts, test="kw")
+isSeasonal(dspread_ts, test="fried")
+
+#We get all FALSE
+
+## Now plot ACF and PACF
+Acf(dspread_ts, lag.max= 52)
+Pacf(dspread_ts, lag.max = 52)
+## Finally, we can affirm that our data does not contain seasonality, so we can work using normal ARIMA models and ARIMA-GARCH models.
+```
+
+We conclude the diagnostic phase by applying the seastests package. All
+individual tests (QS, Seasonal Dummy, Kruskal-Wallis, and Friedman)
+consistently fail to reject the null hypothesis of no seasonality.
+
+Conclusion: Having confirmed that the series is stationary, lacks
+seasonality, and exhibits significant ARCH effects, we can proceed with
+confidence to estimate the non-seasonal ARIMA-GARCH framework.
+
+###3.8.3 Formal Diagnostic Tests: Ljung-Box and ARCH-LM To ensure the
+necessity of both the mean and variance components of the model, we
+perform rigorous diagnostic tests on the differenced training set
+($dtrain$). We select a high lag (e.g., $lag = 16$) to be meticulous in
+detecting long-term dependencies.
+
+```{r}
+# 1. Ljung-Box Test on differences
+lb_ret <- Box.test(as.numeric(dtrain), lag = 10, type = "Ljung-Box")
+cat("\nLB Test on ds p-value:\n", lb_ret$p.value, "\n")
+if(lb_ret$p.value < 0.05) cat("Autocorrelation detected, need mean modelling\n") else cat("ds are White Noise\n")
+
+# 2. Ljung-Box Test on squared differences
+lb_test <- Box.test(as.numeric(dtrain)^2, lag = 10, type = "Ljung-Box")
+cat(sprintf("\nLjung-Box on Squared ds at lag 10:\n %.4f\n", lb_test$p.value))
+if(lb_test$p.value < 0.05) cat("Volatility clustering confirmed\n") else cat("No volatility clustering detected\n")
+
+# 3. ARCH-LM Test (Engle's Test for ARCH effects)
+arch_test <- ArchTest(dtrain, lags = 10)
+cat(sprintf("\nARCH Test (5 lags) LM Test - statistic: %.4f, p-value: %.4f\n", arch_test$statistic, arch_test$p.value))
+if(arch_test$p.value < 0.05) cat("ARCH effects confirmed. GARCH modelling needed\n") else cat("No ARCH effects confirmed\n")
+```
+
+Interpretation of Results:Autocorrelation: If the $p$-value for the
+first Ljung-Box test is below 0.05, we reject the null hypothesis of
+independence, confirming that the spread changes exhibit autocorrelation
+and require an ARMA specification.ARCH Effects: A $p$-value below 0.05
+in both the squared Ljung-Box and the ARCH-LM test provides definitive
+evidence of volatility clustering. This confirms that the variance is
+not constant (Heteroskedasticity), mandating the use of a GARCH model to
+capture time-varying risk.
+
+##3.9 Seasonality Validation: Information Criteria Approach
+While previous visual diagnostics suggested no seasonality, we utilize an
+automated selection procedure to determine if a seasonal frequency
+(SARIMA) provides a statistically superior fit. We compare models across
+plausible frequencies ($f=1$ for non-seasonal, $f=8$, and $f=12$ for
+monthly proxies in weekly data) based on the Akaike Information
+Criterion (AIC).
+
+DONT'T RUN THIS!!!
+```{r}
+#test_freqs <- c(1,5,21, 63,252) # Le frequenze plausibili
+#risultati <- data.frame(Freq = test_freqs, AIC = NA)
+
+#for(i in 1:length(test_freqs)) {
+  # Crea la TS con la frequenza del loop
+#  test_ts <- ts(as.numeric(dtrain), frequency = test_freqs[i])
+  
+  # auto.arima testa se la stagionalità a quella frequenza aiuta il modello
+#  fit <- auto.arima(test_ts, max.q = 10, max.p = 10,seasonal = TRUE,method="ML",stepwise = FALSE,approximation = FALSE)
+#  risultati$AIC[i] <- fit$aic
+#}
+
+# Trova la frequenza migliore
+#best_f <- risultati$Freq[which.min(risultati$AIC)]
+#cat("Il verdetto statistico è: usa la frequenza", best_f)
+```
+
+
+
+
+##3.10 Final Mean Equation Specification Following the automated search,
+we estimate the final non-seasonal $ARIMA$ model to evaluate the
+significance of individual parameters.
+
+```{r}
+m1 <- auto.arima(as.numeric(dtrain),max.q = 15, max.p = 15,method="ML",
+                        seasonal = FALSE, 
+                        stepwise = FALSE, 
+                        approximation = FALSE,
+                        trace = FALSE)
+
+summary(m1)
+```
+Model for daily data (train=4 years): ARIMA(2,0,2)
+
+3.10.1
+Statistical Significance of CoefficientsTo ensure model parsimony, we
+evaluate the significance of each parameter. A coefficient is
+statistically significant at the 95% confidence level if its t-ratio
+($t = \frac{\hat{\phi}}{SE(\hat{\phi})}$) exceeds the critical value of
+$|1.96|$.
+
+```{r}
+check_coef_significance <- function(model) {
+  # Estraiamo coefficienti e standard errors
+  coefs <- model$coef
+  se <- sqrt(diag(model$var.coef))
+  
+  # Calcoliamo la t-statistica (z-score)
+  t_stats <- coefs / se
+  
+  # Calcoliamo i p-value (distribuzione normale a due code)
+  p_values <- (1 - pnorm(abs(t_stats))) * 2
+  
+  # Creiamo una tabella riassuntiva
+  results <- data.frame(
+    Coefficiente = round(coefs, 4),
+    Std_Error = round(se, 4),
+    t_stat = round(t_stats, 4),
+    p_value = round(p_values, 4),
+    Significativo_95 = ifelse(p_values < 0.05, "SI", "NO")
+  )
+  
+  cat("\nAnalisi di Significatività dei Coefficienti:\n")
+  print(results)
+  
+  cat("\nNota: Un coefficiente è significativo al 95% se |t_stat| > 1.96\n")
+  print(results)
+}
+check_coef_significance(m1)
+m1$coef
+```
+
+ALL THE COEFFICIENTS OF m1 SARE TATISTICALLY SIGNIFICANT? t ratios are
+given by estimated coefficients divided by their standard errors; the
+latter are given by the square root of the element on the main diagonal
+(variance of coef)
+
+```{r}
+names(m1)
+summary(m1)
+t.ratios = m1$coef/sqrt(diag(m1$var.coef))
+t.ratios
+```
+BUT since the Lijung Box suggests that the serie is a white noie, we specify also the model m0=ARIMA(0,0,0) to compare the performances
+
+library(forecast)
+```{r}
+# Fit ARIMA(1,0,0) - equivalent to AR(1)
+m0 <- Arima(as.numeric(dtrain), order = c(0, 0, 0), include.constant = FALSE)
+
+# Summary of coefficients and information criteria
+summary(m0)
+```
+
+```{r}
+arma_assumptions <- function(m) {
+  cat("\n============================================================\n")
+  cat("ARIMA model assumptions & Cycle Analysis:\n")
+  
+  # Estrazione corretta per modelli auto.arima/Arima
+  # Usiamo i coefficienti AR per la stazionarietà
+  ar_coefs <- m$model$phi
+  ma_coefs <- m$model$theta
+  
+  # 1. Calcolo Radici
+  ar_roots <- polyroot(c(1, -ar_coefs))
+  ma_roots <- polyroot(c(1, ma_coefs))
+  
+  is_stationary <- all(abs(ar_roots) > 1)
+  is_invertible <- all(abs(ma_roots) > 1)
+  
+  cat("Stationary:", is_stationary, "(Min mod:", round(min(abs(ar_roots)), 3), ")\n")
+  cat("Invertible:", is_invertible, "(Min mod:", round(min(abs(ma_roots)), 3), ")\n")
+  
+  # 2. Analisi dei Business Cycles (Radici Complesse)
+  # Cerchiamo se esistono radici con parte immaginaria significativa
+  complex_roots <- ar_roots[Im(ar_roots) != 0]
+  
+  cat("\n--- Business Cycle Analysis ---\n")
+  if(length(complex_roots) > 0) {
+    cat("The model IMPLIES the existence of cycles.\n")
+    cat("Reason: The AR characteristic equation has complex conjugate roots.\n")
+    
+    # Calcolo del periodo del ciclo (se ti serve per l'analisi)
+    # Periodo = 2*pi / acos(Re(root)/abs(root))
+    root <- complex_roots[1]
+    period <- 2 * pi / atan2(Im(root), Re(root))
+    cat("Estimated average cycle period:", round(abs(period), 2), "units of time.\n")
+  } else {
+    cat("The model DOES NOT imply cycles.\n")
+    cat("Reason: All AR roots are real; the model returns to equilibrium monotonically.\n")
+  }
+  
+  # 3. Check for common roots
+  common_roots <- FALSE
+  if(length(ar_roots) > 0 && length(ma_roots) > 0) {
+    for(ar in ar_roots) {
+      for(ma in ma_roots) {
+        if(abs(ar - ma) < 0.05) common_roots <- TRUE
+      }
+    }
+  }
+  
+  cat("\n--- Root Validation ---\n")
+  if(common_roots) {
+    cat("Common roots detected, assumption violation\n")
+  } else {
+    cat("No common roots detected, assumption validated\n")
+  }
+  cat("============================================================\n")
+}
+
+# Esecuzione
+arma_assumptions(m1)
+```
+
+#### Residual's check
+
+NOTE: Kolmogorov-Smirnov test (KS) to test wheter they follow a
+t-distribution $H_0: \text{serie follows supposed distribution}$
+
+```{r}
+
+cat("\n============================================================\n")
+cat("\nARMA residuals check:\n")
+# ARIMA residuals
+n_parameters1<-sum(m1$coef!=0) 
+n_parameters2<-sum(m0$coef!=0)
+arima_res1<- residuals(m1)
+arima_res2<- residuals(m0)                    
+arma_residual <- function(res,n_parameters) {
+  cat("\n============================================================\n")
+  cat("ANALISI APPROFONDITA DEI RESIDUI\n")
+  cat("============================================================\n")
+
+# 1. Ljung-Box (Media e Autocorrelazione)
+  lb_arima <- Box.test(res, lag = 15, type = "Ljung-Box",fitdf = n_parameters)
+  cat("\n [1]LB test on ARIMA residuals (15 lags) p-value: ", round(lb_arima$p.value, 4), "\n")
+  if(lb_arima$p.value >= 0.05) cat("ARIMA model cleared the mean\n") else cat("ARIMA model DID NOT clear the mean\n")
+#Regola di Hyndman (autore di forecast): Per dati non stagionali si usa $h = 10$, per dati stagionali si usa $h = 2m$ (dove $m$ è la frequenza). Nel tuo caso ($m=8$), dovresti testare almeno fino a 16 lag.
+  
+# 2. Durbin-Watson (Autocorrelazione al lag 1)
+# Nota: Il DW classico si usa su modelli lineari, sui residui ARIMA è indicativo
+  dw_test <- dwtest(as.vector(res) ~ 1)
+  cat("\n[2] Durbin-Watson Test p-value: ", round(dw_test$p.value, 4))
+  if(dw_test$p.value >= 0.05) cat(" -> OK: No autocorrelazione lag 1\n") else cat(" -> KO: Autocorrelazione lag 1\n")
+
+# 3. Breusch-Godfrey Test (Autocorrelazione di ordine superiore)
+  bg_test <- bgtest(as.vector(res) ~ 1, order = 12)
+  cat("\n[3] Breusch-Godfrey Test (order 15) p-value: ", round(bg_test$p.value, 4))
+  if(bg_test$p.value >= 0.05) cat(" -> OK: No autocorrelazione superiore\n") else cat(" -> KO: Autocorrelazione superiore\n")
+  
+# 4. Jarque-Bera Test (Normalità dei residui)
+  jb_test <- jarque.bera.test(res)
+  cat("\n[4] Jarque-Bera Test p-value: ", round(jb_test$p.value, 4))
+  if(jb_test$p.value >= 0.05) cat(" -> OK: Residui Normali\n") else cat(" -> KO: Residui NON Normali (code grasse)\n")
+  
+#5. Kolmogorov-Smirnov (KS)
+  check_t <- function(residuals) {
+  fit_t <- suppressWarnings(fitdistr(residuals, densfun = "t"))
+  mu <- fit_t$estimate["m"]
+  sigma <- fit_t$estimate["s"]
+  df <- fit_t$estimate["df"]
+  std_res <- (residuals - mu) / sigma
+  ks <- ks.test(x = std_res, y = "pt", df = df)
+  cat("\n[5] KS test assuming t-distribution:\n")
+  print(c(DoF = df, KS_p_value = ks$p.value))
+  if(ks$p.value > 0.05) cat("\nResiduals are t-distributed\n") else cat("\nResiduals are NOT t-distributed\n")
+  }
+  check_t(res)
+  # 6. Effetti ARCH (Eteroschedasticità)
+  lb_arima_2 <- Box.test(res^2, lag =15, type = "Ljung-Box",fitdf = n_parameters)
+  cat("\n [6]LB test on ARIMA squared residuals (10 lags) p-value: ", round(lb_arima_2$p.value, 4), "\n")
+  if(lb_arima_2$p.value < 0.05) cat("ARIMA model has residual variance to explain. GARCH model needed\n") else cat("ARIMA model residual variance is OK\n")
+
+  # 7.ARCH test
+  arch_test_res <- ArchTest(res, lags = 15)
+  cat(sprintf("\n [7]ARCH Test on ARIMA (5 lags) residuals:\n LM Test - statistic: %.4f, p-value: %.4f\n", 
+              arch_test_res$statistic, arch_test_res$p.value))
+  if(arch_test_res$p.value < 0.05) cat("ARCH effects confirmed. GARCH modelling needed\n") else cat("No ARCH effects confirmed\n")
+}
+
+print(arma_residual(arima_res1,n_parameters1))
+print(arma_residual(arima_res2,n_parameters2))
+```
+m1=ARIMA(2,0,2) pass all the tests, while m0=ARIMA(0,0,0) shows autocorrelation up to lag 15 (but if we set breush-Godfrey up to lag 11, there is not autocorrelation, so the problem is the lag 12)
+
+ORA FACCIAMO STA BENEDETTA PREVISIONE:
+IN SAMPLE PREDICTIONS
+
+```{r}
+# Estraiamo i valori fittati dal modello m1
+fitted_values <- fitted(m1)
+length(fitted_values)
+length(train)
+# Visualizzazione grafica: Reale vs Fittato
+plot(as.numeric(dtrain), type="l", col="black", lwd=1, 
+     main="In-Sample Evaluation: Reale vs ARIMA",
+     ylab="Spread", xlab="Tempo (Osservazioni)")
+lines(as.numeric(na.omit(fitted_values)), col="red")
+legend("topright", legend=c("Dato Reale", "Fitted"), col=c("black", "red"), lty=1, lwd=2)
+```
+
+IN SAMPLE EVALUATION
+
+```{r}
+residuals <- dtrain - fitted_values
+
+# Core metrics
+accuracy(as.numeric(dtrain), as.numeric(fitted_values))
+# R-squared (will be 0 or near 0 — expected for mean model)
+SS_res <- sum(residuals^2, na.rm = TRUE)
+SS_tot <- sum((dtrain - mean(train, na.rm = TRUE))^2, na.rm = TRUE)
+R2 <- 1 - SS_res / SS_tot
+cat("R2 del modello:", round(R2, 2), "%") 
+
+# Calcoliamo i segni (1 per positivo, -1 per negativo)
+sign_actual <- sign(dtrain)
+sign_fitted <- sign(fitted_values)
+
+# Creiamo un vettore logico: TRUE se i segni sono uguali
+hits <- (sign_actual == sign_fitted)
+
+# Calcoliamo la percentuale di successo (escludendo eventuali NA)
+DA <- mean(hits, na.rm = TRUE) * 100
+DA
+```
+
+OUT-SAMPLE PREDICTION AND EVALUATION
+
+```{r}
+# 1. Applichiamo il modello alla serie completa (genera tutti i forecast 1-step)
+refit <- Arima(dspread, model = m1)
+
+# 2. Estraiamo solo i valori fittati che corrispondono al periodo di TEST
+# (Supponiamo che il tuo test set sia lungo 33 osservazioni)
+pred_out <- tail(fitted(refit), n_test)
+reali_out <- tail(as.numeric(dspread), n_test)
+
+# 3. Calcolo metriche Out-of-Sample
+accuracy(pred_out, reali_out)
+
+# R-squared (will be 0 or near 0 — expected for mean model)
+SS_res <- sum((pred_out-reali_out)^2, na.rm = TRUE)
+SS_tot <- sum((test - mean(test, na.rm = TRUE))^2, na.rm = TRUE)
+R2 <- 1 - SS_res / SS_tot
+cat("R2 del modello:", round(R2, 2), "%") 
+
+# Calcoliamo i segni (1 per positivo, -1 per negativo)
+sign_actual <- sign(test)
+sign_fitted <- sign(pred_out)
+hits <- (sign_actual == sign_fitted)
+# Calcoliamo la percentuale di successo (escludendo eventuali NA)
+DA <- mean(hits, na.rm = TRUE) * 100
+cat("DA del modello:", round(DA, 2), "%") 
+
+```
+IF WE SUBSTITUTE m1 with m0, we can see that m1 perform better both insample and out-sample
+
+FORECAST DI domani PROSSIMA (diff_spreads)
+
+```{r}
+# 2. Generiamo la previsione per la prossima settimana
+forecast_next_week <- forecast(refit, h = 1)
+
+# 3. Visualizziamo il risultato
+print(forecast_next_week)
+
+# 4. Grafico della previsione con intervalli di confidenza
+plot(forecast_next_week, main = "Previsione Spread BTP-Bund: Settimana Prossima", 
+     ylab = "Spread", xlab = "Tempo")
+```
+
+Lo 80 / Hi 80 (da -21.79 a +22.18): Il modello è sicuro all'80% che la
+variazione dello spread oscillerà tra una discesa di 21.8 punti e una
+salita di 22.2 punti. È un range abbastanza ampio che riflette la
+volatilità tipica dei mercati.
+
+Lo 95 / Hi 95 (da -33.43 a +33.82): Il modello è sicuro al 95% (standard
+statistico per la tesi) che la variazione non supererà i ±33 punti base.
+
+Nota tecnica: Se la prossima settimana lo spread dovesse muoversi di 50
+punti, sapresti che è successo un evento "fuori dal comune" (un outlier)
+che il modello non poteva prevedere. TRASFORMAZIONE IN spread:
+
+```{r}
+# 1. Recuperiamo l'ultimo valore REALE dello spread (non differenziato)
+ultimo_spread_reale <- tail(spread, 1) 
+
+# 2. Otteniamo la previsione della differenza (il "delta")
+previsione_diff <- forecast(m1, h = 1)$mean[1]
+
+# 3. Calcoliamo lo spread atteso
+spread_previsto <- ultimo_spread_reale + previsione_diff
+
+cat("Lo spread previsto per domani è:", spread_previsto)
+```
+
+CONSIDERARE DI FARE UNA CROSS VALIDATION PER UNA ROBA PIU ACCURATA
+
+############################################################################################################ 
+
+## Volatility Analysis
+
+We restart from our model
+
+```{r}
+summary(m1)
+```
+
+Remark that the mean is = 0 so we can work directly on residuals
+
+```{r}
+fitted_values <- fitted(m1)
+res<-dtrain - fitted_values
+par(mfrow = c(3, 1), mar = c(3, 4, 3, 2))
+
+plot(index(as.xts(dspread)), coredata(as.xts(dspread)), type = "l", lwd = 0.7,
+     main = "Residuals^2 ", xlab = "", ylab = "ds")
+abline(h = 0, col = "black", lwd = 0.5)
+Acf(as.numeric(res)^2,   lag.max = 30, main = "ACF of res^2")
+Pacf(as.numeric(res)^2,  lag.max = 30, main = "PACF of res^2")
+par(mfrow = c(1, 1))
+```
+
+Check for autocorrelation and ARCH effects on `train`:
+
+```{r}
+n_parameters<-sum(m1$coef!=0) 
+# Ljung-Box on DS^2
+lb_ds2 <- Box.test(as.numeric(res)^2, lag = 10, type = "Ljung-Box",fitdf = n_parameters)
+cat(sprintf("LB Test on DS^2 p-value: %.4f\n", lb_ds2$p.value))
+if (lb_ds2$p.value < 0.05) cat("Volatility clustering confirmed\n") else cat("No volatility clustering detected\n")
+
+# ARCH test
+arch_test <- ArchTest(as.numeric(res), lags = 10)
+cat(sprintf("ARCH Test (10 lags) p-value: %.4f\n", arch_test$p.value))
+if (arch_test$p.value < 0.05) cat("ARCH effects confirmed — GARCH modelling needed\n") else cat("No ARCH effects\n")
+
+```
+
+We clearly need a specification model for volatility, but which one?
+Let's see if we have a unit root (i.e if the shock in volatility is persistent)
+```{r}
+adf.test(as.numeric(res)^2)
+```
+We reject the hyptosisi of unit root --> so we don't need to use IGARCH (correggetemi se sbaglio)
+
+## Model 3: ARMA-GARCH
+
+We try to find the best ARMA-GARCH fitting different combinations of
+models, then decide considering a precise IC, kinda like an auto_arima
+but hand-builded.
+
+Create a function that simulates 1 iteration of a for cycle, then
+instead of a for cycle use parrallel (mclapply) It will run the function
+over $n$ times using $n$ CPU simultanealy.
+
+Can change the critera or modify the parameters, if too much
+combinations the code will run for ages.
+
+We will keep the max possible GARCH orders to 1, that's cause vast
+majority of the time a GARCH(1,1) is perfect for financial series. We
+could add more GARCH model other than `sGARCH`and `eGARCH` but since
+those are the most used we keep only them, also other models have
+additional parameter than can increase the computational time. We also
+capped max ARMA order to 3 to prevent the AIC from picking up noise (it
+does, tried to run multiple times and it gives back models that do not
+pass diagnostic tests).
+
+The ugarch solvers (`gosolnp`) use random generate starting point, to
+have reproducibility of results we need to impose a seed whenever a
+optimization is done.
+
+**NOTE**: in `dists` you choose the distribution you suppose the std
+residuals will follow, `norm`= normal, `std`= t, `sstd`= skewed t. I
+removed `norm`and cause the function would wrongly choose `norm` over
+the other 2: you can see if is the distribution fit the residuals in the
+printed residual plot or in the "Adjusted Pearson Goodness-of-Fit Test"
+at the end of the model output, when `norm` the fit is worse. The
+distribution that better fit the residuals is `sstd` (even if not
+perfect).
+
+The reason is that `sstd` and `std` have more parameters than `norm`
+(number of parameter: `sstd` \> `std` \> `norm`) and since the train
+data is "small" this penalize them more than it should in the eye of
+AIC/BIC. `norm` will end up with better IC than `sstd` but then you have
+the wrong distribution for the residuals and/or fail the diagnostic
+tests.
+
+**NOTE 2**: `mc.cores = detectCores() - 1` is a MAC thing, on Windows it
+does not work, it will show that the code is running on x core but
+actually will use just one, like a normal `for` cycle.
+
+eval = FALSE --> Questo codice NON verrà eseguito con "Run All"
+```{r,eval = FALSE}
+start_time <- proc.time() # to see for how much the code run
+
+best_garch <- function(y,
+                       ar_lags  = 0:5,
+                       ma_lags  = 0:5,
+                       garch_p  = 1:1,
+                       garch_q  = 1:1,
+                       models   = c("sGARCH", "sGARCH-M"),
+                       dists    = c("sstd", "std"),
+                       criteria = "aic", 
+                       timeout  = 60, 
+                       seed = 42) {
+
+  # reproducibility for the hybrid solver, it uses random starting point
+  RNGkind("L'Ecuyer-CMRG")
+  set.seed(seed)
+
+  # Create every combinations possible for the parameter
+  combos <- expand.grid(
+    ar_lag  = ar_lags,
+    ma_lag  = ma_lags,
+    garch_p = garch_p,
+    garch_q = garch_q,
+    model   = models,
+    dist    = dists,
+    stringsAsFactors = FALSE
+  )
+
+  cat("Total combinations to fit:", nrow(combos), "\n")
+  cat("Running on", parallel::detectCores() - 1, "cores\n")
+  cat("It could take couple of minutes ...\n\n")
+
+  fit_one <- function(i) {
+    arp   <- combos$ar_lag[i]
+    map   <- combos$ma_lag[i]
+    gp    <- combos$garch_p[i]
+    gq    <- combos$garch_q[i]
+    model <- combos$model[i]
+    dist  <- combos$dist[i]
+
+    spec <- ugarchspec(
+      variance.model     = list(model = model, garchOrder = c(gp, gq)),
+      mean.model         = list(armaOrder = c(arp, map), include.mean = TRUE),
+      distribution.model = dist
+    )
+    # If R encounter an error it stop the cycle, tryCatch catch the error and return NULL, then continue
+    fit <- tryCatch({
+      withTimeout({
+        suppressWarnings(
+          ugarchfit(spec = spec, data = y, solver = "gosolnp", 
+          solver.control = list(n.restarts = 5, rseed = 42, trace = 0)) # for reproducibility)
+        )
+      },
+      timeout   = timeout,
+      onTimeout = "silent")
+    },
+    error   = function(e) NULL)
+
+    # Store only not null + right class
+    if (!is.null(fit) && inherits(fit, "uGARCHfit") && fit@fit$convergence == 0) {
+      ic <- infocriteria(fit)
+      return(data.frame(
+        ar_p    = arp,
+        ma_q    = map,
+        garch_p = gp,
+        garch_q = gq,
+        model   = model,
+        dist    = dist,
+        aic     = as.numeric(round(ic["Akaike", ] * length(y), 2)), # the function calculate the aic only for that obs
+        bic     = as.numeric(round(ic["Bayes",  ] * length(y), 2)),
+        likelihood = as.numeric(round(likelihood(fit), 2)),
+        stringsAsFactors = FALSE
+      ))
+    }
+    return(NULL)
+  }
+
+# Run more itrations simultanely with every CPU-1, instead of for cycle
+# results_list = mclapply(
+#    seq_len(nrow(combos)),
+#    fit_one,
+#    mc.cores = detectCores() - 1
+#  )
+  
+  
+# questa è versione macOS:
+ results_list <- mclapply(
+  seq_len(nrow(combos)),
+  fit_one,
+  mc.cores = N_CORES  # usa la variabile definita sopra
+)
+  
+  #versione per Windows:
+  #  Crea il "ponte" tra i core del tuo PC (Cluster)
+  #cl <- makeCluster(detectCores() - 1)
+  # Esporta tutto ciò che serve ai core "figli" (fondamentale su Windows!)
+  # Esportiamo i dati (y), la tabella (combos), la funzione (fit_one) e il timeout
+  #clusterExport(cl, varlist = c("combos", "y", "timeout", "fit_one"), envir = environment())
+  # Carica le librerie su ogni singolo core
+  #clusterEvalQ(cl, {
+  #  library(rugarch)
+  #  library(R.utils)
+  #  library(dplyr)
+  #})  
+  # Esegui il calcolo (parLapply sostituisce mclapply)
+  #results_list <- parLapply(cl, seq_len(nrow(combos)), fit_one)
+  # IMPORTANTE: Spegni i motori una volta finito
+ gc(verbose = FALSE)
+
+# Keep only non NULL model
+  successful <- Filter(Negate(is.null), results_list)
+  cat("Successful fits:", length(successful), "/", nrow(combos), "\n")
+  cat("Models ordered by: ", criteria, "\n")
+
+  results_df <- bind_rows(successful) |> arrange(.data[[criteria]])
+  return(results_df)
+}
+
+results = best_garch(train)
+cat("\nFitted models:\n")
+print(head(results))
+
+end_time <- proc.time()
+execution_time <- end_time - start_time
+cat("\n Total execution time: ", execution_time[3], "seconds")
+```
+
+
+```{r}
+library(parallel)
+library(R.utils)
+library(rugarch)
+library(dplyr)
+start_time <- proc.time() # to see for how much the code run
+
+best_garch <- function(y,
+                       ar_lags = 0:5, ma_lags = 0:5,
+                       garch_p = 1:1,  garch_q = 1:1,
+                       # Usiamo "-M" come etichetta personalizzata
+                       models  = c("sGARCH", "sGARCH-M"),
+                       dists   = c("norm", "std", "sstd"),
+                       criteria = "bic", timeout = 60) {
+
+  combos <- expand.grid(
+    ar_lag = ar_lags, ma_lag = ma_lags,
+    garch_p = garch_p, garch_q = garch_q,
+    model_label = models, # Questa è la nostra etichetta
+    dist = dists,
+    stringsAsFactors = FALSE
+  )
+
+  cat("Total combinations to fit:", nrow(combos), "\n")
+  num_cores <- detectCores() - 1
+
+  fit_one <- function(i) {
+    # Carichiamo i parametri della riga i
+    row  <- combos[i, ]
+    arp  <- row$ar_lag; map <- row$ma_lag
+    gp   <- row$garch_p; gq <- row$garch_q
+    dist <- row$dist
+    
+    # --- TRADUZIONE LOGICA ---
+    # 1. Controlliamo se nell'etichetta c'è "-M"
+    is_archm <- grepl("-M", row$model_label)
+    
+    # 2. Puliamo il nome per passarlo a variance.model (es: "sGARCH-M" -> "sGARCH")
+    clean_v_model <- gsub("-M", "", row$model_label) 
+
+    # 3. Configuriamo lo spec con la distinzione tra Media e Varianza
+    spec <- ugarchspec(
+      variance.model = list(model = clean_v_model, garchOrder = c(gp, gq)),
+      mean.model     = list(armaOrder = c(arp, map), 
+                            include.mean = TRUE, 
+                            archm = is_archm), # <--- Attiva il GARCH-M qui
+      distribution.model = dist
+    )
+    fit <- tryCatch({
+      withTimeout({
+        suppressWarnings(
+          ugarchfit(spec = spec, data = y, solver = "gosolnp", 
+          solver.control = list(n.restarts = 5, rseed = 42, trace = 0)) # for reproducibility)
+        )
+      },
+      timeout   = timeout,
+      onTimeout = "silent")
+    },
+    error   = function(e) NULL)
+    
+    if (!is.null(fit) && inherits(fit, "uGARCHfit")) {
+      ic <- infocriteria(fit)
+      return(data.frame(
+        ar_p = arp, ma_q = map, garch_p = gp, garch_q = gq,
+        model = row$model_label, # Restituisce l'etichetta originale (es. sGARCH-M)
+        dist = dist,
+        aic = as.numeric(round(ic["Akaike", ] * length(y), 2)),
+        bic = as.numeric(round(ic["Bayes",  ] * length(y), 2)),
+        likelihood = as.numeric(round(likelihood(fit), 2)),
+        stringsAsFactors = FALSE
+      ))
+    }
+    return(NULL)
+  }
+
+  # Gestione Cluster (Windows richiede export esplicito)
+  os_name <- Sys.info()["sysname"]
+  if (os_name == "Windows") {
+    cl <- makeCluster(num_cores)
+    clusterExport(cl, varlist = c("y", "combos", "fit_one"), envir = environment())
+    clusterEvalQ(cl, { library(rugarch); library(R.utils) })
+    results_list <- parLapply(cl, seq_len(nrow(combos)), fit_one)
+    stopCluster(cl)
+  } else {
+    results_list <- mclapply(seq_len(nrow(combos)), fit_one, mc.cores = num_cores)
+  }
+
+  successful <- Filter(Negate(is.null), results_list)
+  if (length(successful) == 0) return(NULL)
+  
+  results_df <- bind_rows(successful) |> arrange(.data[[criteria]])
+  return(results_df)
+}
+
+results <- best_garch(as.numeric(train))
+cat("\nTop models by BIC:\n")
+print(head(results))
+
+end_time <- proc.time()
+execution_time <- end_time - start_time
+cat("\n Total execution time: ", execution_time[3], "seconds")
+```
+Extract the best model.
+
+```{r, fig.width=12, fig.height=10, out.width="100%",}
+arma_best_order <- c(results$ar_p[1], results$ma_q[1])
+garch_best_order  <- c(results$garch_p[1], results$garch_q[1])
+best_dist  <- results$dist[1]
+best_mod  <- results$model[1]
+
+cat("\nBest ARMA-GARCH model orders:\nARMA:  ", arma_best_order, "\nGARCH: ", garch_best_order,"\n") 
+  garch_spec <- ugarchspec(variance.model = list(model = best_mod, garchOrder = garch_best_order),
+                         mean.model = list(armaOrder =arma_best_order, include.mean = TRUE),
+                         distribution.model = best_dist)
+
+set.seed(42)
+garch_fit <- ugarchfit(spec = garch_spec, data = dtrain, solver = "gosolnp", 
+solver.control = list(n.restarts = 5, rseed = 42, trace = 0)) # for reproducibility
+
+
+```
+best model with dtrain(4 anni)(max garch par=3) = ARMA-GARCH(4,1)-(3,3),distribution=std (RANK=AIC)  agg.03_04 
+best model with dtrain(4 anni)(max garch par=1) = ARMA-GARCH(4,2)-(1,1),distribution=sstd (RANK=AIC) agg.03_04  
+best model with dtrain(4 anni)(max garch par=1) = ARMA-GARCH(3,2)-(1,1),distribution=norm (RANK=BIC) agg.03_04
+best model with dtrain(4 anni)(max garch par=1) = ARMA-GARCH(1,0)-(1,1),distribution=norm (RANK=BIC) agg.10_04
+best model with dtrain(4 anni)(max garch par=1) = ARMA-GARCH-M(1,0)-(1,1),distribution=norm (RANK=AIC) agg.10_04
+Sulla base del criterio informativo **BIC**, il modello che meglio approssima la dinamica dello spread BTP-Bund è un **ARMA(3,2)-sGARCH(1,1)** con distribuzione dei residui Normale.
+
+## Function to check the garch positivity of coefficients
+```{r,}
+
+# ============================================================
+# GARCH POSITIVITY & STATIONARITY CHECK (rugarch)
+# ============================================================
+check_garch_positivity <- function(fit, model_name = "GARCH fit") {
+
+  cf    <- fit@fit$coef
+  # omega is always named "omega" in rugarch
+  omega <- cf["omega"]
+  # alpha coefficients: alpha1, alpha2, ...
+  alphas <- cf[grepl("^alpha[0-9]+", names(cf))]
+  # beta coefficients: beta1, beta2, ...
+  betas  <- cf[grepl("^beta[0-9]+",  names(cf))]
+
+  persistence <- sum(alphas) + sum(betas)
+
+  positivity_ok   <- (omega > 0) & all(alphas >= 0) & all(betas >= 0)
+  stationarity_ok <- persistence < 1
+
+  cat("\n============================================================\n")
+  cat("GARCH POSITIVITY & STATIONARITY CHECK:", model_name, "\n")
+  cat("============================================================\n")
+  cat(sprintf("  omega  = %+.6f  > 0?  %s\n",
+              omega,  ifelse(omega > 0,      "YES ✓", "NO  ✗")))
+
+  for (nm in names(alphas)) {
+    cat(sprintf("  %-7s= %+.6f  >= 0? %s\n",
+                nm, alphas[nm], ifelse(alphas[nm] >= 0, "YES ✓", "NO  ✗")))
+  }
+  for (nm in names(betas)) {
+    cat(sprintf("  %-7s= %+.6f  >= 0? %s\n",
+                nm, betas[nm],  ifelse(betas[nm]  >= 0, "YES ✓", "NO  ✗")))
+  }
+
+  cat(sprintf("\n  Persistence (sum α + sum β) = %.6f  < 1? %s\n",
+              persistence, ifelse(stationarity_ok, "YES ✓ (covariance stationary)", "NO  ✗ (IGARCH or explosive)")))
+
+  if (positivity_ok & stationarity_ok) {
+    uncond_var <- as.numeric(omega) / (1 - persistence)
+    cat(sprintf("  Unconditional variance       = %.6f\n", uncond_var))
+    cat(sprintf("  Unconditional vol (daily)    = %.4f bps\n", sqrt(uncond_var)))
+    cat("  --> All positivity conditions SATISFIED ✓\n")
+  } else {
+    if (!positivity_ok)   cat("  --> WARNING: Positivity condition VIOLATED ✗\n")
+    if (!stationarity_ok) cat("  --> WARNING: Stationarity condition VIOLATED (persistence >= 1) ✗\n")
+  }
+  cat("============================================================\n\n")
+
+  invisible(list(
+    omega         = omega,
+    alphas        = alphas,
+    betas         = betas,
+    persistence   = persistence,
+    positivity_ok = positivity_ok,
+    stationarity_ok = stationarity_ok
+  ))
+}
+
+```
+
+## Check garch positivity of coefficients
+
+```{r,}
+# --- Positivity check on the training GARCH fit ---
+check_garch_positivity(garch_fit, model_name = "ARMA-GARCH (training fit)")
+
+# check the ACF of the standardized residuals
+Acf(garch_fit@fit$z)
+
+# check the ACF of the squared residuals
+Acf(garch_fit@fit$z^2,lag.max=30,main = "ACF of Squared Std. Residuals")
+#Ljung-Box test
+Box.test(garch_fit@fit$z^2, lag = 20, type = "Ljung-Box", fitdf = 2)
+```
+Dobbiamo preoccuparci di cui lag significativi al 19 e 23?
+## Analisi del Modello Ottimale: ARMA(3,2)-sGARCH(1,1)
+
+### 1. Parametri della Varianza (GARCH)
+
+I coefficienti stimati descrivono la struttura della volatilità e la sua evoluzione temporale:
+
+* **$\omega$ (Omega) = 0.512**: Rappresenta la costante della varianza. Essendo positiva, assicura un livello minimo di volatilità ("rumore di fondo") sempre presente nel mercato.
+* **$\alpha_1$ (Alpha) = 0.201**: Misura la reattività immediata. Indica che il **20%** di uno shock inatteso (news, eventi politici) si traduce istantaneamente in nuova volatilità per il giorno successivo.
+* **$\beta_1$ (Beta) = 0.777**: Indica la persistenza. Suggerisce che il **77%** della volatilità odierna viene trascinata per inerzia al giorno seguente, riflettendo una memoria lunga degli shock finanziari.
+
+### 2. Diagnostica di Stabilità
+
+L'affidabilità del modello è confermata dal superamento dei test di stabilità matematica:
+
+* **Persistenza ($\alpha + \beta$) = 0.978**: Il valore è inferiore a 1, garantendo che il modello sia **stazionario**. Lo spread tende quindi a riassorbire gli shock e a convergere verso la sua media nel lungo periodo.
+* **Volatility Clustering**: La prossimità del valore a 1 conferma la tendenza della volatilità a manifestarsi a "blocchi" (periodi di alta tensione seguiti da periodi di calma).
+
+### 3. Indicatori di Lungo Periodo
+
+* **Varianza Incondizionata**: 23.73
+* **Volatilità Incondizionata (Daily)**: **4.87 bps**
+
+> **Interpretazione**: In condizioni di equilibrio, lo spread oscilla mediamente di circa 4.9 punti base al giorno. Variazioni significativamente superiori indicano una fase di stress che eccede la norma statistica del periodo analizzato.
+
+## Diagnostic
+
+```{r,}
+show(garch_fit)
+infocriteria(garch_fit)*length(train)
+```
+
+In the ARMA(3,2)-GARCH(1,1) output look at:
+
+-   "Weighted Ljung-Box Test on Standardized Residuals"
+-   "Weighted Ljung-Box Test on Standardized Squared Residuals"
+-   "Weighted ARCH LM Tests"
+-   "Adjusted Pearson Goodness-of-Fit Test" --\> HO: la distribuzione
+    scelta fitta bene i dati
+    
+```{r,}
+plot(garch_fit,which=9)#does  seem too good
+plot(garch_fit,which=8)
+
+#JB test
+residui_std <- garch_fit@fit$z
+jb_test <- jarque.bera.test(residui_std)
+print(jb_test)
+```
+obv normal distribution would not be a good idea but check if Shewed student t distribution would be better
+    
+Extract the best model with std o or sstd distribution
+
+```{r, fig.width=12, fig.height=10, out.width="100%",}
+library(rugarch)
+library(tseries)
+
+# Funzione per estrarre metriche
+get_metrics <- function(fit, label) {
+  ni <- infocriteria(fit)
+  data.frame(
+    Model = label,
+    AIC = ni[1]*length(dtrain),
+    BIC = ni[2]*length(dtrain),
+    Likelihood = as.numeric(likelihood(fit)),
+    Pearson_p_min = min(gof(fit, c(20, 30, 40, 50))[,3]), # p-value minimo tra i vari group
+    stringsAsFactors = FALSE
+  )
+}
+
+# --- 1. Modello con distribuzione Student-t (std) ---
+garch_spec_std <- ugarchspec(variance.model = list(model = best_mod, garchOrder = garch_best_order),
+                         mean.model = list(armaOrder =arma_best_order, include.mean = TRUE),
+                         distribution.model = "std")
+
+set.seed(42)
+garch_fit_std <- ugarchfit(spec = garch_spec_std, data = dtrain, solver = "gosolnp", 
+solver.control = list(n.restarts = 5, rseed = 42, trace = 0)) # for reproducibility
+
+# --- 2. Modello con distribuzione Skew-Student-t (sstd) ---
+garch_spec_sstd <- ugarchspec(variance.model = list(model = best_mod, garchOrder = garch_best_order),
+                         mean.model = list(armaOrder =arma_best_order, include.mean = TRUE),
+                         distribution.model = "sstd")
+
+set.seed(42)
+garch_fit_sstd <- ugarchfit(spec = garch_spec_sstd, data = dtrain, solver = "gosolnp", 
+solver.control = list(n.restarts = 5, rseed = 42, trace = 0)) # for reproducibility
+# --- Confronto Metriche ---
+comp_table <- rbind(get_metrics(garch_fit_std, "Student-t (std)"),
+                    get_metrics(garch_fit_sstd, "Skew-Student-t (sstd)"))
+
+print(comp_table)
+
+# --- Visualizzazione QQ-Plot ---
+par(mfrow = c(1, 2))
+plot(garch_fit_std, which = 9, main = "QQ-Plot: Student-t")
+plot(garch_fit_sstd, which = 9, main = "QQ-Plot: Skew-Student-t")
+
+```
+Student t distribution wins so we don't have do change the model
+
+```{r}
+show(garch_fit)
+```
+
+**Analisi del Sign Bias Test (Engle e Ng)**
+
+Il **Sign Bias Test** è stato condotto per verificare se il modello GARCH scelto sia in grado di catturare adeguatamente le potenziali asimmetrie nella volatilità (ovvero se shock positivi e negativi di pari entità abbiano un impatto differente sulla varianza futura).
+
+Interpretazione dei risultati
+* **Accettazione di $H_0$**: Tutti i p-value sono ampiamente superiori alla soglia critica di **0.05**. Non è possibile rifiutare l'ipotesi nulla di assenza di effetti di asimmetria nei residui.
+* **Sufficienza del Modello**: Il test conferma che il modello **sGARCH(1,1)**, pur essendo una specifica simmetrica, è statisticamente **sufficiente** per descrivere la serie storica dello spread BTP-Bund analizzata.
+* **Conclusione**: Non vi è prova che i rialzi dello spread generino una volatilità significativamente diversa rispetto ai ribassi (al netto di quanto già catturato dal modello). Pertanto, non è necessario ricorrere a specifiche asimmetriche più complesse (come eGARCH o GJR-GARCH), garantendo la parsimonia della stima.
+
+N.B: È sorprendente per lo spread BTP-Bund: Di solito, lo spread reagisce in modo asimmetrico (la paura di un aumento dello spread genera più panico di quanto un calo generi euforia).
+Se il test ti dà p-value così alti (0.74), significa che nel periodo che hai analizzato, la volatilità è stata guidata dall'entità degli shock (quanto grandi erano) piuttosto che dal loro segno (se erano positivi o negativi).--> CHECK LITERATURE
+
+
+The model pass all the tests.
+
+We also test if there's any breakpoint inside the residuals. We use:
+
+-   Bau-Perron test: tests for multiple unknow structural breaks in the
+    mean, it find the best breaks location that minimizes the RSS, then
+    selects the number of breaks minimizing BIC. The number of breaks
+    with lowest BIC is the correct one.
+-   CUSUM: tests for parameter instability by tracking the cumulative
+    sum of recursive residuals, a deviation of this sum from 0 means
+    instability, $H_0:$ stable parameters throught the sample.
+
+
+```{r, fig.width=12, fig.height=10, out.width="100%",}
+par(mfrow = c(2, 1))
+resid_std <- residuals(garch_fit, standardize = TRUE) |> as.numeric()
+
+bp_resid_df <- data.frame(
+  resid = resid_std,
+  date  = index(dtrain) 
+)
+bp_resid <- breakpoints(resid ~ 1, data = bp_resid_df, h = 0.15)
+summary(bp_resid)
+plot(bp_resid)
+
+cusum_resid <- efp(resid ~ 1, data = bp_resid_df, type = "Rec-CUSUM")
+plot(cusum_resid)
+sctest(cusum_resid)
+
+par(mfrow = c(1, 1))
+```
+
+Checking the RSS table we can see that we have the optimal BIC at 0
+breaks -\> the residuals do not need breakpoint, adding any break will
+make the model worse. Also the RSS remain almost equal with differents
+possibles breaks: adding breaks will not explain anything more.
+
+We fail to reject the null in the CUSUM test since the line in plot stay
+inside the confidence intervals -\> parameters are stable.
+
+Combined both tests tell us that there's no evidence of structural
+breaks in the standardize residuals, any possible change presents in the
+raw series is explained by the model.
+
+## Comment
+
+The estimated model pass all the tests: there's no mean or volatility to
+model and the residual fit the supposed distribution (t-skewed) and pass
+the tests. Our data can be modelled with this ARMA-GARCH model, next we
+run a validation process for its forecasts and collect some metrics. \#
+Validation Now the validation phase, we take the best estimated
+ARMA-GARCH and validate through the test data. At every iteration we
+refit the model (re-estimate the parameter) but the structure of the
+model remain the same: the goal is to calculate how good the model is at
+forecasting to then forecast the real future value.
+
+Then we compare the forecast with a Random Walk model to test it our
+model is actually useful.
+
+-   Forecast on test data using rolling forecast (window increases on 1
+    week every iteration)
+-   Refit the model every 1 iteration (1 week) to keep model useful
+-   Perform the rolling estimation and forecast
+-   refit.every = 1 means we re-estimate the model every single
+    iteration
+-   If window.size too small the model will fail to converge
+
+
+Il grafico "Conditional SD vs Observations" sovrappone la volatilità stimata dal modello ($\sigma_t$) ai dati reali (i residui o le variazioni dello spread).   
+Ecco come interpretarlo:  
+1. Cosa rappresentano le linee?
+--> La linea nera (o i punti):  Rappresenta i dati reali osservati (nel tuo caso, le variazioni giornaliere dello spread $\Delta \text{Spread}_t$). Mostra quanto il mercato si è mosso effettivamente in quel giorno.  
+--> La linea colorata (spesso rossa o blu): Rappresenta la Conditional Standard Deviation ($\sigma_t$), ovvero la previsione del rischio fatta dal modello GARCH. Di solito viene visualizzata come un "inviluppo" (sopra e sotto i dati, o solo sopra come valore assoluto).
+2. Cosa deve succedere se il modello è buono?  
+Inseguimento (Tracking): La linea della volatilità deve "seguire" l'ampiezza dei dati reali. Quando vedi dei picchi nei dati neri (shocks), la linea della volatilità deve alzarsi immediatamente.Contenimento: La linea della volatilità dovrebbe agire come un "guscio". I dati reali dovrebbero quasi sempre restare all'interno della fascia definita dalla volatilità stimata (solitamente $\pm 2\sigma$ o $\pm 1.96\sigma$).Reattività: Se c'è un periodo di calma (dati neri piatti), la linea della volatilità deve scendere gradualmente (GARCH decay).3. Cosa indica un fallimento?Se vedi grandi esplosioni nei dati neri (punti molto distanti) ma la linea della volatilità rimane piatta, il modello è troppo lento (sottostima il rischio).Se la linea della volatilità rimane altissima anche quando il mercato è tornato calmo da tempo, il modello è troppo persistente (sovrastima il rischio).
+
+
+```{r,eval=FALSE}
+start_time <- proc.time()
+
+# ── ugarchroll con cache ─────────────────────────────────
+if (file.exists("roll.rds")) {
+  roll <- readRDS("roll.rds")
+  message("✓ roll caricato da cache")
+} else {
+  c1 <- make_mac_cluster()
+  on.exit(stopCluster(c1), add = TRUE)
+  set.seed(42)
+  roll <- ugarchroll(garch_spec, data = dtrain,
+                     n.ahead = 1,
+                     forecast.length = length(dtest),
+                     refit.every = 10,
+                     refit.window = "moving",
+                     cluster = c1)
+  stopCluster(c1)
+  gc(verbose = FALSE)
+  saveRDS(roll, "roll.rds")
+  message("✓ roll salvato in roll.rds")
+}
+# ────────────────────────────────────────────────────────
+
+# Gestione non-convergenza
+if (length(roll@model$nonconverged) > 0) roll <- resume(roll, solver = "nloptr")
+if (length(roll@model$nonconverged) > 0) roll <- resume(roll, solver = "solnp")
+if (length(roll@model$nonconverged) > 0) roll <- resume(roll, solver = "hybrid")
+
+# Estrai risultati
+roll_df <- as.data.frame(roll)
+quants  <- as.data.frame(roll, which = "VaR")
+
+actual <- as.numeric(quants[, "realized"])
+VaR_95 <- as.numeric(quants[, "alpha(5%)"])
+VaR_99 <- as.numeric(quants[, "alpha(1%)"])
+
+# VaR Test 95%
+cat("=== VaR Test 95% ===\n")
+var_test_95 <- VaRTest(alpha = 0.05, actual = actual, VaR = VaR_95, conf.level = 0.95)
+print(var_test_95)
+
+# VaR Test 99% — Kupiec manuale
+cat("=== VaR Test 99% (Kupiec only) ===\n")
+n_obs    <- length(actual)
+n_viol   <- sum(actual < VaR_99)
+expected <- 0.01 * n_obs
+lr_stat  <- -2 * (log(0.01^n_viol * 0.99^(n_obs-n_viol)) -
+                   log((n_viol/n_obs)^n_viol * (1-n_viol/n_obs)^(n_obs-n_viol)))
+p_val    <- 1 - pchisq(lr_stat, df = 1)
+
+cat("Violazioni osservate:", n_viol, "| Attese:", round(expected, 1), "\n")
+cat("Kupiec LR statistic:", round(lr_stat, 4), "\n")
+cat("Kupiec p-value:", round(p_val, 4), "\n")
+if (p_val > 0.05) cat("Esito: VaR 99% correttamente calibrato\n") else cat("Esito: VaR 99% NON calibrato\n")
+
+# Forecast dataframe
+dfc_df <- data.frame(
+  pred_mu  = roll_df$Mu,
+  pred_var = roll_df$Sigma^2,
+  pred_vol = roll_df$Sigma,
+  ci_q05   = quants[, "alpha(5%)"],
+  ci_q95   = quants[, "alpha(1%)"],
+  actual   = roll_df$Realized
+)
+rownames(dfc_df) <- rownames(roll_df)
+print(dfc_df)
+
+end_time <- proc.time()
+cat("\nTotal execution time:", (end_time - start_time)[3], "seconds\n")
+```
+
+
+VERSIONE PER WINDOWS + CORREZIONE (HO MESSO ANCHE I QUANTILI SUPERIORI PER IL CALCOLO DELLA DISTRIBUTION COVERAGE NEL CHUNCK SUCCESSIVO )
+
+```{r}
+start_time <- proc.time()
+
+library(parallel)
+library(rugarch)
+
+# ── ugarchroll universale (Windows & Mac) ────────────────────────
+if (file.exists("roll.rds")) {
+  roll <- readRDS("roll.rds")
+  message("✓ roll caricato da cache")
+} else {
+  # 1. Rileva i core e crea il cluster
+  n_cores <- detectCores() - 1
+  c1 <- makeCluster(n_cores)
+  
+  # 2. Carica rugarch su ogni core (necessario su Windows)
+  clusterEvalQ(c1, library(rugarch))
+  
+  on.exit(stopCluster(c1), add = TRUE)
+  set.seed(42)
+  
+  # 3. Esecuzione con tutti i quantili (per evitare l'errore precedente)
+  roll <- ugarchroll(garch_spec, data = dtrain,
+                     n.ahead = 1,
+                     forecast.length = length(dtest),
+                     refit.every = 10,
+                     refit.window = "moving",
+                     VaR.alpha = c(0.01, 0.05, 0.95, 0.99), # Inclusi i quantili alti
+                     cluster = c1)
+  
+  stopCluster(c1)
+  gc(verbose = FALSE)
+  saveRDS(roll, "roll.rds")
+  message("✓ roll salvato in roll.rds")
+}
+# ────────────────────────────────────────────────────────
+
+# Gestione non-convergenza
+if (length(roll@model$nonconverged) > 0) roll <- resume(roll, solver = "nloptr")
+if (length(roll@model$nonconverged) > 0) roll <- resume(roll, solver = "solnp")
+if (length(roll@model$nonconverged) > 0) roll <- resume(roll, solver = "hybrid")
+
+# Estrai risultati
+roll_df <- as.data.frame(roll)
+quants  <- as.data.frame(roll, which = "VaR")
+
+actual <- as.numeric(quants[, "realized"])
+VaR_95 <- as.numeric(quants[, "alpha(5%)"])
+VaR_99 <- as.numeric(quants[, "alpha(1%)"])
+
+# --- VaR Test 95% ---
+cat("=== VaR Test 95% (Kupiec only) ===\n")
+n_obs    <- length(actual)
+n_viol_95 <- sum(actual < VaR_95)
+expected_95 <- 0.05 * n_obs
+# Calcolo manuale LR per coerenza
+lr_stat_95 <- -2 * (log(0.05^n_viol_95 * 0.95^(n_obs-n_viol_95)) -
+                    log((n_viol_95/n_obs)^n_viol_95 * (1-n_viol_95/n_obs)^(n_obs-n_viol_95)))
+p_val_95 <- 1 - pchisq(lr_stat_95, df = 1)
+
+cat("Violazioni osservate:", n_viol_95, "| Attese:", round(expected_95, 1), "\n")
+cat("Kupiec p-value:", round(p_val_95, 4), "\n")
+cat(if(p_val_95 > 0.05) "Esito: VaR 95% correttamente calibrato\n" else "Esito: VaR 95% NON calibrato\n")
+
+# --- VaR Test 99% ---
+cat("\n=== VaR Test 99% (Kupiec only) ===\n")
+n_viol_99 <- sum(actual < VaR_99)
+expected_99 <- 0.01 * n_obs
+lr_stat_99 <- -2 * (log(0.01^n_viol_99 * 0.99^(n_obs-n_viol_99)) -
+                    log((n_viol_99/n_obs)^n_viol_99 * (1-n_viol_99/n_obs)^(n_obs-n_viol_99)))
+p_val_99 <- 1 - pchisq(lr_stat_99, df = 1)
+
+cat("Violazioni osservate:", n_viol_99, "| Attese:", round(expected_99, 1), "\n")
+cat("Kupiec p-value:", round(p_val_99, 4), "\n")
+cat(if(p_val_99 > 0.05) "Esito: VaR 99% correttamente calibrato\n" else "Esito: VaR 99% NON calibrato\n")
+
+dfc_df <- data.frame(
+  pred_mu   = roll_df$Mu,
+  pred_var  = roll_df$Sigma^2,
+  pred_vol  = roll_df$Sigma,
+  ci_q01    = quants[, "alpha(1%)"],
+  ci_q05    = quants[, "alpha(5%)"],
+  #ci_q95    = quants[, "alpha(95%)"],
+  #ci_q99    = quants[, "alpha(99%)"],
+  actual    = roll_df$Realized
+)
+
+rownames(dfc_df) <- rownames(roll_df)
+print(dfc_df)
+
+end_time <- proc.time()
+cat("\nTotal execution time:", (end_time - start_time)[3], "seconds\n")
+
+```
+
+### Analisi dei Risultati di Backtesting
+
+I test di copertura incondizionata (Kupiec Test) mostrano un comportamento divergente del modello ai due livelli di confidenza analizzati.
+
+#### 1. VaR 95%: Calibrazione Ottimale
+Al livello del 95%, il modello risulta **perfettamente calibrato**.
+* **Analisi:** Il numero di violazioni osservate (**12**) è identico al valore atteso teorico. 
+* **Statistica:** Il p-value di **0.8613** è ampiamente sopra la soglia critica di 0.05, indicando che non vi è alcuna prova statistica per rigettare l'ipotesi di correttezza del modello.
+
+#### 2. VaR 99%: Eccesso di Conservatività
+Al livello del 99%, il modello viene respinto dal test statistico ($p = 0.0244$), ma per motivi di **efficienza** piuttosto che di sicurezza.
+* **Analisi:** Sono state osservate **0 violazioni** a fronte di un'attesa di **2.5**. 
+* **Causa Tecnica (Student-t):** L'utilizzo della distribuzione **t di Student** introduce "code grasse" (leptocurtosi). In assenza di shock estremi nel periodo di test, la distribuzione t tende a sovrastimare la probabilità di eventi rari, spingendo la soglia del VaR molto lontano dalla media.
+* **Effetto:** Il modello è "troppo prudente". Sebbene protegga completamente dalle perdite (zero sforamenti), in un contesto operativo richiederebbe un accantonamento di capitale eccessivo e inefficiente.
+
+
+#### 3. Considerazioni sul Campione (Sample Size)
+Il fallimento del test al 99% è influenzato anche dalla dimensione del campione (circa 250 osservazioni). Con un'attesa di sole 2.5 violazioni, la sensibilità del test di Kupiec è estremamente elevata: la differenza tra un modello "calibrato" e uno "non calibrato" è spesso legata alla presenza o assenza di una singola violazione (il cosiddetto "problema dei piccoli campioni").
+
+---
+**Conclusione:** Il modello è affidabile per la gestione del rischio standard (95%), ma risulta eccessivamente penalizzante per la gestione del rischio estremo (99%), probabilmente a causa di un parametro *shape* della distribuzione t molto basso o di una bassa volatilità nel periodo di test.
+
+```{r,}
+# --- Mean evaluation ---
+# Usiamo i nomi definiti nel dataframe dfc_df
+errors <- dfc_df$actual - dfc_df$pred_mu
+
+mae  <- mean(abs(as.numeric(errors)), na.rm = TRUE)
+mse  <- mean(as.numeric(errors)^2, na.rm = TRUE)
+rmse <- sqrt(mse)
+mape <- mean(abs(as.numeric(errors) / as.numeric(dfc_df$actual)), na.rm = TRUE)
+
+# Directional Accuracy: il modello azzecca il segno del movimento?
+dir_acc <- mean(sign(as.numeric(dfc_df$actual)) == sign(as.numeric(dfc_df$pred_mu)), na.rm = TRUE)
+
+cat("\nMean evaluation metrics:\n")
+cat(sprintf("MAE: %.4f | MSE: %.4f | RMSE: %.4f | MAPE: %.4f | Dir. Acc: %.2f%%\n",
+            mae, mse, rmse, mape, dir_acc * 100))
+
+# --- Distribution check  ---
+# Coverage 90% (tra 5% e 95%)
+coverage_90 <- mean(dfc_df$actual >= dfc_df$ci_q05 & dfc_df$actual <= dfc_df$ci_q95, na.rm = TRUE)
+
+# Coverage 98% (tra 1% e 99%)
+coverage_98 <- mean(dfc_df$actual >= dfc_df$ci_q01 & dfc_df$actual <= dfc_df$ci_q99, na.rm = TRUE)
+
+cat("\nDistribution evaluation, % of forecast that fall into that interval:\n")
+cat(sprintf("90%% coverage: %.4f\n", coverage_90))
+cat("\nDistribution evaluation, % of forecast that fall into that interval:\n")
+cat(sprintf("98%% coverage: %.4f\n", coverage_98))
+```
+1. Interpretazione dei Risultati
+90% Coverage: 0.9008 (90.08%)
+
+Questo è un risultato quasi perfetto. Significa che lo spread reale è caduto all'interno del tunnel previsto (tra il 5% e il 95%) nel 90% dei casi. Il tuo modello non è né troppo ottimista né troppo pessimista; descrive la realtà con una precisione chirurgica.
+
+98% Coverage: 0.9841 (98.41%)
+
+Anche qui siamo vicinissimi al target del 98% (l'intervallo tra l'1% e il 99%). Questo indica che anche nelle situazioni più estreme, le "code" della tua distribuzione t di Student sono calibrate correttamente.
+
+
+
+
+Poiché la volatilità è la varianza, confrontiamo la Varianza Predetta ($pred\_var$) con lo Shock Reale al quadrato ($Residui^2$).
+Aggiungi questo al tuo codice:
+Se la correlazione è positiva e significativa, il modello sta catturando i cluster di rischio.
+
+
+Compare those metrics with a Random Walk model (tomorrow's value =
+today's value). To see if our model is actually useful.
+
+```{r,}
+dspread_rw <- dspread[length(dtrain):(length(dtrain) + length(dtest) - 1)] |> as.numeric()
+
+mae_rw   <- mean(abs(dspread_rw - dfc_df$actual))
+rmse_rw  <- sqrt(mean((dspread_rw - dfc_df$actual)^2))
+mape_rw  <- mean(abs((dspread_rw - dfc_df$actual) / dfc_df$actual))
+dir_rw   <- mean(sign(dspread_rw) == sign(diff(as.numeric(dfc_df$actual))))
+
+cat("\nEvalutation metrics, Model vs Random Walk:\n")
+cat(sprintf("\nModel  | MAE: %.4f | RMSE: %.4f | MAPE: %.2f%% | Dir: %.2f%%\n",
+            mae, rmse, mape*100, dir_acc*100))
+cat(sprintf("RW   | MAE: %.4f | RMSE: %.4f | MAPE: %.2f%% | Dir: %.2f%%\n",
+            mae_rw, rmse_rw, mape_rw*100, dir_rw*100))
+```
+2. Perché il MAPE non è adatto allo Spread
+Il MAPE è una metrica "traditrice" per i tassi di interesse e gli spread per due motivi:
+
+Problema di scala: Se lo spread passa da 1 a 2 punti base, l'errore è solo di 1 bp (trascurabile), ma il MAPE segna un errore del 100%.
+
+Asset che possono annullarsi: Per variabili che fluttuano attorno allo zero o che possono toccarlo, il MAPE perde validità statistica.
+
+```{r, fig.width=12, fig.height=10, out.width="100%",}
+dfc_df$date <- as.Date(rownames(dfc_df))
+
+## Adding the ci_q95 and ci_q99
+dfc_df$ci_q95 <- 2 * dfc_df$pred_mu - dfc_df$ci_q05  # mirror of lower bound
+dfc_df$ci_q99 <- 2 * dfc_df$pred_mu - dfc_df$ci_q01
+
+p_spreads  <- ggplot(dfc_df, aes(x = date)) +
+  geom_line(aes(y = actual, color = "Actual"), linewidth = 0.8) +
+  geom_line(aes(y = pred_mu, color = "Forecasted"), linewidth = 0.8) +
+  geom_line(aes(y = dspread_rw, color = "Random Walk"), linewidth = 0.8) +
+  geom_ribbon(aes(ymin = ci_q05, ymax = ci_q95), fill = "blue", alpha = 0.3) +
+  scale_color_manual(values = c("Actual" = "black", "Forecasted" = "blue", "Random Walk" = "red")) +
+  labs(title = "Spread: Actual vs Forecasted", x = "", y = "Basis points") +
+  scale_x_date(date_breaks = "2 month", date_labels = "%b-%y") +
+  scale_y_continuous(breaks = scales::breaks_width(20)) +
+  theme_minimal() +
+  theme(legend.title = element_blank(), legend.position = "bottom")
+
+print(p_spreads)
+
+```
+
+# Forecast
+
+Forecast future value for next week, use in the same structure of the
+validated model.
+
+Use the last `window_size` data (the same as validation phase)
+
+```{r,}
+# Forecast future value for next week
+# Use the last window_size data
+
+# 1. Recupero dati e data (usiamo dspread che è l'oggetto xts/zoo)
+window_size <- 110  
+data_fit_obj <- tail(dspread, window_size) 
+data_fit     <- as.numeric(data_fit_obj)
+last_date    <- index(tail(data_fit_obj, 1))
+
+set.seed(42)
+future_fit <- ugarchfit(spec = garch_spec, data = data_fit, solver = "gosolnp",
+                        solver.control = list(n.restarts = 5, rseed = 42, trace = 0))
+
+# --- Positivity check on the forecast window GARCH fit ---
+check_garch_positivity(future_fit, model_name = "ARMA-GARCH (forecast window)")
+
+future_fc_obj <- ugarchforecast(future_fit, n.ahead = 1)
+
+# Estrazione quantili e valori
+q_05_val <- as.numeric(quantile(future_fc_obj, probs = 0.05))
+q_95_val <- as.numeric(quantile(future_fc_obj, probs = 0.95))
+
+future_fc <- data.frame(
+  d_spread = as.numeric(fitted(future_fc_obj)),
+  vol      = as.numeric(sigma(future_fc_obj)),
+  q_05     = q_05_val,
+  q_95     = q_95_val
+)
+
+# 2. Funzione di conversione (Assicurati che 'data' sia un vettore numerico o xts)
+spread_conversion <- function(value, q_05, q_95, data){
+  # Usiamo as.numeric per forzare il calcolo matematico
+  last_spread <- as.numeric(tail(data, 1))
+  
+  res_spread <- last_spread + value
+  res_q05    <- last_spread + q_05
+  res_q95    <- last_spread + q_95
+  
+  result_df  <- data.frame(
+    spread = res_spread,
+    q_05   = res_q05,
+    q_95   = res_q95
+  )
+  return(result_df)
+}
+
+# 3. CHIAMATA CRITICA: Usa 'spread' (l'oggetto zoo dei livelli) NON 'df'
+future_spread <- spread_conversion(future_fc$d_spread, future_fc$q_05, future_fc$q_95, spread)
+
+# Output
+cat("\nForecasted values:\n")
+cat("\nSpread on last date (", as.character(last_date), "): ", as.numeric(tail(spread, 1)))
+cat("\nSpread forecasted for next week (", as.character(last_date + 7), "):\n")
+print(future_spread)
+```
+
+## Simulation Forecast (10,000 paths)
+
+Simulating 10,000 paths accounts for the GARCH shock uncertainty, not
+just the ARMA mean.
+
+```{r,}
+simulation <- ugarchsim(
+  future_fit,
+  n.sim       = 1,
+  m.sim       = 10000,
+  startMethod = "sample"
+)
+
+mean_sim <- mean(fitted(simulation))
+vol_sim  <- mean(sigma(simulation))
+q_90     <- quantile(fitted(simulation), probs = c(0.05, 0.95))
+
+cat(sprintf("Mean DS:  %.4f\n", mean_sim))
+cat(sprintf("Mean Vol: %.4f\n", vol_sim))
+cat(sprintf("Quantiles 5%% | 95%%: %.4f | %.4f\n", q_90[1], q_90[2]))
+
+sim_spread <- spread_conversion(mean_sim, unname(q_90[1]), unname(q_90[2]), spread)
+cat("Spread forecast (simulation) for next week:", as.character(last_date + 7), ":\n")
+print(sim_spread)
+```
+
+Se i risultati di sim_spread sono molto simili a quelli di future_spread
+(ottenuti con forecast), significa che il tuo modello è stabile. Se sono
+molto diversi, potrebbe esserci molta incertezza o asimmetria nella
+distribuzione dei rendimenti.
+
+

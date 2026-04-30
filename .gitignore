@@ -1,6 +1,13 @@
 # Created by https://www.toptal.com/developers/gitignore/api/r
 # Edit at https://www.toptal.com/developers/gitignore?templates=r
 
+# Ignore Mac system files
+.DS_Store
+
+# Ignore R Markdown generated files
+*_files/
+*.html
+
 ### R ###
 # History files
 .Rhistory
