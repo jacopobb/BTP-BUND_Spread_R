@@ -1,0 +1,669 @@
+---
+title: "Spread: ARMA-GARCH Model"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+date: "2026-04-30"
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# Data setup
+```{r, include = FALSE}
+rm(list = ls())
+gc()
+```
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+library(ggplot2)
+library(patchwork)
+library(tidyverse)
+library(vars)
+library(rmgarch)
+library(rugarch)
+library(MTS)
+library(urca)
+library(xts)
+library(readxl)
+library(lmtest)
+library(MASS)
+library(scales)
+library(strucchange)
+library(httpgd)
+```
+FVR
+FF
+## Load data
+```{r}
+spread <- read_excel("spread_daily_30_04.xlsx")
+ois3m <- read_excel("OIS3M_30_04.xlsx")
+euribor3m <- read_excel("euribor3M_30_04.xlsx")
+ESDE <- read_excel("SPREAD_ES_30_04.xlsx")
+IEDE <- read_excel("SPREAD_IE_30_04.xlsx")
+
+data <- spread |>
+  left_join(ois3m, by = "Date") |>
+  left_join(euribor3m, by = "Date") |>
+  left_join(ESDE, by = "Date")|>
+  left_join(IEDE, by = "Date")
+
+data <- data[-1, ]
+data <- data |>
+  mutate(across(-Date, as.numeric))
+
+data <- data |> rename(spread = names(data)[2],
+                       ois3m = names(data)[3],
+                       euribor3m = names(data)[4],
+                       ESDE = names(data)[5],
+                       IEDE=names(data)[6])
+
+data$spread <- as.numeric(data$spread) * -1
+data$ESDE <- as.numeric(data$ESDE) * -1
+data$IEDE <- as.numeric(data$IEDE) * -1
+data$eurois3m <-data$euribor3m - data$ois3m
+data <- data |> dplyr::select(Date,eurois3m, ,ESDE, IEDE,spread)
+
+# 3. GESTIONE NA OTTIMIZZATA (Sostituisce na.omit)
+# Trasformiamo in data.frame per usare le funzioni di zoo in modo vettoriale
+data_filled <- data %>%
+  arrange(Date) %>%
+  # Riempie i buchi interni (es. festività sfasate tra paesi)
+  mutate(across(-Date, ~ na.approx(., na.rm = FALSE))) %>%
+  # Riempie i NA rimanenti all'inizio e alla fine (trascinamento valori)
+  mutate(across(-Date, ~ na.locf(., na.rm = FALSE))) %>%
+  mutate(across(-Date, ~ na.locf(., fromLast = TRUE, na.rm = FALSE)))
+data <- xts(data_filled[-1], order.by = as.Date(data_filled$Date))
+```
+
+```{r, echo=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+df_plot <- data.frame(date = index(data), coredata(data))
+
+p_spread <- ggplot(df_plot, aes(x=date, y=spread)) +
+  geom_line() +
+  labs(title="Spread", x="", y="") +
+  theme_bw()
+
+p_eurois3m <- ggplot(df_plot, aes(x=date, y=eurois3m)) +
+  geom_line() +
+  labs(title="Euribor 3M - OIS3M", x="", y="") +
+  theme_bw()
+
+p_ESDE <- ggplot(df_plot, aes(x=date, y=ESDE)) +
+  geom_line() +
+  labs(title="ESDE", x="", y="") +
+  theme_bw()
+
+p_IEDE <- ggplot(df_plot, aes(x=date, y=IEDE)) +
+  geom_line() +
+  labs(title="IEDE", x="", y="") +
+  theme_bw()
+
+(p_spread  + p_eurois3m + p_ESDE + p_IEDE) + plot_layout(nrow=3, ncol=2)
+```
+
+# Data preparation
+## Train/Test
+Use only the last `year` years of data, then split.
+```{r}
+n_test  <- round(nrow(data) * 0.2)
+n_train <- nrow(data) - n_test
+
+train <- data[1:n_train]
+test  <- data[(n_train + 1):nrow(data)]
+
+cat("\nTraining observations:", n_train)
+cat("\nTest observations:", n_test)
+cat("\nTrain period:", as.character(index(train)[1]), "->", as.character(index(train)[nrow(train)]))
+cat("\nTest period:", as.character(index(test)[1]), "->", as.character(index(test)[nrow(test)]),"\n")
+```
+
+## Stationarity
+Check if raw data are stationary around a drift with ADF test, use `ur.df()`, then first-difference and check again
+```{r}
+check_stat <- function(series, type = c("adf", "kpss")) {
+  # To run both just don't select the type
+  df_list <- list()
+  # ADF test
+  if ("adf" %in% type) {
+     for (test in c("none", "drift", "trend")) {
+      adf <- ur.df(series, type = test, selectlags = "AIC")
+      row <- data.frame(
+        test_type = paste("ADF: ", test),
+        teststat = adf@teststat[1],
+        cval = adf@cval[1, "5pct"],
+        result = ifelse(adf@teststat[1] < adf@cval[1, "5pct"], "Stationary", "Non-Stationary")
+      )
+      df_list[[length(df_list) + 1]] <- row
+    }
+  }
+  # KPSS test
+  if ("kpss" %in% type) {
+    for (test in c("mu", "tau")) {
+      kpss <- ur.kpss(series, type = test, lags = "short")
+      row <- data.frame(
+        test_type = paste("KPSS: ", ifelse(test == "mu", "const", "trend")),
+        teststat = kpss@teststat,
+        cval = kpss@cval[1, "5pct"],
+        result = ifelse(kpss@teststat < kpss@cval[1, "5pct"], "Stationary", "Non-Stationary")
+      )
+      df_list[[length(df_list) + 1]] <- row
+    }
+  }
+  df <- bind_rows(df_list)
+  return(df)
+}
+
+cat("\nRaw data:\n")
+for (name in names(train)){
+  test_stat <- check_stat(train[, name], type = "adf")
+  cat(name, ":\n")
+  print(test_stat)
+}
+
+var_dif = c("spread","ESDE","IEDE")
+d_data = data
+d_data[, var_dif] = d_data[, var_dif] |> diff()
+d_data = d_data |> na.omit()
+d_train <- d_data[1:(n_train - 1)]
+d_test  <- d_data[n_train:nrow(d_data)]
+
+cat("\nTransformed data:\n")
+for (name in names(d_train)){
+  test_stat <- check_stat(d_train[, name], type = "adf")
+  cat(name, ":\n")
+  print(test_stat)
+}
+```
+
+- `spread` series showed non-stationary behaviour, it does says "trend stationary" but looking at the series plot we can see that the supposed trend isn't linear,
+for semplicity we decided to difference it. 
+- We differenced ` eur1m` becasu, even if it pass the test, if not differenced it will cause problems in the model, 
+the differenced series works better, also looking at the plot we can see that its stationarity is kinda false since it doesn't look like it.
+- On the other side, and `eurois3m` is perfectly stationary. 
+
+```{r, echo=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+d_df_plot <- data.frame(date = index(d_train), coredata(d_train))
+
+p_spread <- ggplot(d_df_plot, aes(x=date, y=spread)) +
+  geom_line() +
+  labs(title="Spread", x="", y="") +
+  theme_bw()
+
+p_eurois3m <- ggplot(d_df_plot, aes(x=date, y=eurois3m)) +
+  geom_line() +
+  labs(title="Euribor 3M - OIS3M", x="", y="") +
+  theme_bw()
+
+p_ESDE <- ggplot(df_plot, aes(x=date, y=ESDE)) +
+  geom_line() +
+  labs(title="ESDE", x="", y="") +
+  theme_bw()
+
+p_IEDE <- ggplot(df_plot, aes(x=date, y=IEDE)) +
+  geom_line() +
+  labs(title="IEDE", x="", y="") +
+  theme_bw()
+
+(p_spread  + p_eurois3m + p_ESDE + p_IEDE) + plot_layout(nrow = 3, ncol = 2)
+```
+
+# VAR
+## Estimation
+Check if there's autocorrelation between variables
+```{r}
+mq(d_train, lag = 10)
+```
+
+Test shows there's autocorrelation present across variables
+
+Check if variables granger-cause `spread`
+
+```{r, warning=FALSE}
+var_names = names(d_train)
+
+print(var_names)
+
+for (v in var_names[var_names != "spread"]) {
+  cat("\n", v, "\n")
+  print(lmtest::grangertest(d_train[,v], d_train[,"spread"], order = 5))
+}
+```
+
+Both granger-cause `spread`
+
+Find the optimal lag
+```{r}
+selection = vars::VARselect(y = d_train, lag.max = 10,
+                            type = "const")
+
+print(t(selection$criteria))
+print(selection$selection)
+```
+
+Following the AIC we will estimate a VAR(5).
+```{r}
+model = vars::VAR(d_train, lag=5, type = "const")
+summary(model)
+```
+
+Now we simplify the model eliminating non-significant parameters, with t-ratio < 1.64 $(\alpha = 10\%)$
+```{r}
+model_s = vars::restrict(model, method = "ser", thresh = 1.64)
+fixed_p = model_s$p
+fixed_params = model_s$restrictions
+summary(model_s)
+```
+
+```{r}
+count_coeff = function(model){
+  names = names(model$varresult)
+  n = c()
+  for (name in names){
+    n = c(n, length(model$varresult[[name]]$coefficients))
+  }
+  sum(n)
+}
+
+cat("\nUnrestricted model coeff: ", count_coeff(model),
+    " Restricted model coeff: ", count_coeff(model_s), "\n")
+cat("\nUr model SC: ", BIC(model), "R model SC: ", BIC(model_s))
+cat("\nUr model AIC: ", AIC(model), "R model AIC: ", AIC(model_s))
+```
+
+### Diagnostic test
+#### Residuals autocorrelation
+```{r, fig.width=12, fig.height=10, out.width="100%"}
+par(ask = FALSE)
+plot(vars::serial.test(model_s, lags.pt = 10, type = "PT.adjusted"))
+```
+
+Run a Portmanteau test $H_0: \text{No cross-correlation}$ to test for autocorrelatino in residuals
+```{r}
+adj_var = (nrow(coef(model_s)$spread) + nrow(coef(model_s)$ESDE) + nrow(coef(model_s)$eurois3m) + nrow(coef(model_s)$IEDE))
+res = residuals(model_s)
+mq(res,lag=10, adj = adj_var)
+
+
+```
+
+We fail reject $H_0$, indicating the presence of no autocorrelation in residuals, apart from some rejection in the further away lags
+
+
+
+Then we test for ARCH effects
+
+### ARCH test
+```{r}
+vars::arch.test(model_s, lags.single = 16, lags.multi = 5, multivariate.only = FALSE)
+```
+We strongly reject the null of no ARCH effects, a GARCH modelling is required. 
+
+Test for stability in the residuals series with the CUSUM test, if the series cross the 5% significance level
+the parameters are unstable
+
+### Stability test
+We run CUSUM test to check for possible structural breaks
+```{r, echo=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+par(ask = FALSE)
+plot(vars::stability(model_s))
+```
+
+All variables residuals lay around 0, even if they slighty drift. There's no evidence of structural breaks
+
+#### Normality
+Check if residuals are normal distributed, if not try to fit them to a t-distribution (more likely).
+
+Use a KS test to test wheter they follow a t-distribution $H_0: \text{serie follows supposed distribution}$
+```{r, warning=FALSE}
+# p_value < 0.05 -> non-normal distributed
+vars::normality.test(model_s, multivariate.only = FALSE)
+
+check_dist <- function(residuals) {
+  t = suppressWarnings(MASS::fitdistr(residuals, densfun = "t",
+        start = list(m = mean(residuals), s = sd(residuals), df = 5)))  # <- add this
+  n = MASS::fitdistr(residuals, densfun = "normal")
+  aic = c(AIC(t), AIC(n))
+  bic = c(BIC(t), BIC(n))
+  df = data.frame(aic, bic, row.names = c("t", "n"))
+  df
+}
+
+apply(residuals(model_s), 2, check_dist)
+```
+
+We reject the null of the JB test for all the univariate series and the joint multivariate, thus the residuals do not follow a normal distribution.
+
+The subsequent code, consisting in estimating a normal a t distribution on the residuals and then compute their IC, showed that a t-distribution 
+is a better fit than the normal.
+
+#### Causality
+```{r}
+vars::causality(model_s, cause = c("eurois3m","ESDE","IEDE"))
+vars::causality(model, cause = c( "eurois3m","ESDE","IEDE"))
+#In the restricted model the granger-causality disappear ???
+```
+
+
+
+### Impulse Response Functions IRF
+```{r, echo=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+par(ask = FALSE)
+irf_result <- vars::irf(model_s,
+                        impulse   = c("eurois3m","ESDE","IEDE"),
+                        response  = "spread",
+                        n.ahead   = 20,
+                        boot      = TRUE,
+                        ci        = 0.95,
+                        runs      = 500)
+plot(irf_result)
+# Creiamo una funzione rapida per estrarre la significatività
+cat("--- ANALISI SIGNIFICATIVITÀ LAG (CI 95%) ---\n")
+
+for(x in irf_result$impulse) {
+  # Recuperiamo i lag usando la tua funzione check_sig
+  lags <- (which((irf_result$Lower[[x]] > 0 & irf_result$Upper[[x]] > 0) | 
+                 (irf_result$Lower[[x]] < 0 & irf_result$Upper[[x]] < 0)) - 1)
+  
+  # Formattiamo l'output per ogni variabile
+  if(length(lags) > 0) {
+    cat(sprintf("%-12s : Significativo ai lag [%s]\n", x, paste(lags, collapse = ", ")))
+  } else {
+    cat(sprintf("%-12s : Nessun lag significativo\n", x))
+  }
+}
+
+cat("--------------------------------------------\n")
+```
+
+### Forecast Error Variance Decomposition FEVD
+```{r, echo=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+par(ask = FALSE)
+fevd_result <- vars::fevd(model_s, n.ahead = 20)
+plot(fevd_result)
+```
+
+# GARCH
+For the mulivariate GARCH we use the DCC way
+
+Then i re-run the same tests to see it the model is better.
+```{r}
+res = residuals(model_s)
+
+uni_spec = ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+  mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+  distribution.model = "std"
+)
+
+multi_spec = multispec(replicate(ncol(res), uni_spec))
+
+dcc_spec = dccspec(uspec = multi_spec, dccOrder = c(1,1), distribution = "mvt")
+
+dcc_fit = dccfit(dcc_spec, data = res)
+```
+
+```{r, echo=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+# --- Estrazione delle correlazioni dinamiche ---
+dcc_corr = rcor(dcc_fit)
+dcc_corr
+
+# --- Creazione del dataframe con indici SCALATI ---
+corr_df = data.frame(
+  date            = as.Date(dimnames(dcc_corr)[[3]]),
+  spread_eurois3m = dcc_corr[4, 1, ],  
+  spread_esde     = dcc_corr[4, 2, ], 
+  spread_iede     = dcc_corr[4, 3, ],  
+  row.names       = NULL
+)
+
+# --- Plot ---
+ggplot(corr_df, aes(x = date)) +
+  geom_line(aes(y = spread_eurois3m, col = "spread : eurois3m"), linewidth = 0.7) +
+  geom_line(aes(y = spread_esde,     col = "spread : ESDE"),     linewidth = 0.7) +
+  geom_line(aes(y = spread_iede,     col = "spread : IEDE"),     linewidth = 0.7) +
+  labs(title = "Dynamic Conditional Correlations (Target: Spread)", 
+       x = "Date", y = "Correlation Coefficient", col = "Pairs") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+Check for residuals ARCH effect on DCC standard residuals
+```{r}
+std_res <- residuals(dcc_fit) / sigma(dcc_fit)
+MTS::MarchTest(std_res, lag = 10)
+```
+
+Fail to reject the null, the series do not have any volatility clustering anymore.
+
+Check for distributional assumptions. 
+```{r, warning=FALSE}
+apply(std_res, 2, check_dist)
+```
+
+They appear to better follow a t-distribution
+
+No ARCH effects and right distributional assumptions -> Model is correctly specified.
+
+# Validation
+Validate the model via rolling forecast on test data, the window dimension is set to the same window used for 
+the diagnostic, we keep the same structure we tested but re-estimating the coefficients at every iteration, 
+we can do that by fixing the parameter when restricting the VAR model.
+Then transform back to spread and evaluate
+```{r}
+set.seed(42)
+start_time <- proc.time()
+
+invert_diff <- function(d, last) last + d
+
+window_size <- nrow(d_train)
+len         <- nrow(d_test)
+
+df <- data.frame(
+  date = rep(as.Date(NA), len),
+  act_spread  = numeric(len),act_eurois3m   = numeric(len),act_esde = numeric(len), act_iede = numeric(len),
+  fc_spread   = numeric(len), fc_spread_lo   = numeric(len), fc_spread_up   = numeric(len),
+  fc_eurois3m = numeric(len), fc_eurois3m_lo = numeric(len), fc_eurois3m_up = numeric(len),
+  fc_esde = numeric(len), fc_esde_lo = numeric(len), fc_esde_up = numeric(len),
+  fc_iede = numeric(len), fc_iede_lo = numeric(len), fc_iede_up = numeric(len)
+)
+
+last  <- xts::last
+first <- xts::first
+
+data_mat <- coredata(data)   # plain matrix, numeric indexing is safe
+
+for (i in 1:len) {
+  start <- n_train - window_size + i - 1
+  end   <- start + window_size - 1
+  window_data <- d_data[start:end, ]
+
+  # Last value, d_data, end_data lost one row
+  orig_idx <- end + 1
+  
+  # Guard: skip if out of bounds
+  if (orig_idx + 1 > nrow(data)) break
+  
+  #last_spread  <- as.numeric(coredata(data)[orig_idx, "spread"])
+
+
+  last_spread <- data_mat[orig_idx, "spread"]
+  last_esde   <- data_mat[orig_idx, "ESDE"]
+  last_iede   <- data_mat[orig_idx, "IEDE"]
+  
+  df$act_spread[i]   <- data_mat[orig_idx + 1, "spread"]
+  df$act_eurois3m[i] <- data_mat[orig_idx + 1, "eurois3m"]
+  df$act_esde[i]     <- data_mat[orig_idx + 1, "ESDE"]
+  df$act_iede[i]     <- data_mat[orig_idx + 1, "IEDE"]
+  
+  #df$act_spread[i]  <- as.numeric(coredata(data)[orig_idx + 1, "spread"])
+  #df$act_eurois3m[i] <- as.numeric(coredata(data)[orig_idx + 1, "eurois3m"])
+
+  # VAR
+  roll_var <- vars::VAR(window_data, p = fixed_p, type = "const")
+  roll_var_s <- vars::restrict(roll_var, method = "manual", resmat = fixed_params)
+  fc <- predict(roll_var_s, n.ahead = 1)
+
+  # DCC 
+  roll_res <- residuals(roll_var_s)
+  roll_dcc_fit <- dccfit(dcc_spec, data = roll_res, solver = c("hybrid", "gosolnp"),
+                         fit.control = list(eval.se = FALSE))
+  
+  if (roll_dcc_fit@mfit$convergence != 0 || is.null(roll_dcc_fit@mfit$coef)) {
+    warning(paste("DCC did not converge at i =", i, "- skipping"))
+    next
+  }
+  
+  dcc_fc  <- dccforecast(roll_dcc_fit, n.ahead = 1)
+  dof  <- roll_dcc_fit@mfit$coef["[Joint]mshape"]
+  t_sc <- qt(p = 0.975, df = dof)
+
+  # Extract
+  d_spread  <- fc$fcst$spread[1,  "fcst"]
+  d_eurois3m  <- fc$fcst$eurois3m[1,  "fcst"]
+  d_esde     <- fc$fcst$ESDE[1, "fcst"]
+  d_iede     <- fc$fcst$IEDE[1, "fcst"]
+  
+  sigma <- rcov(dcc_fc)
+  se    <- sqrt(diag(sigma[[1]][, , 1]))
+
+  # Point forecasts
+  df$date[i]       <- index(d_test)[i]
+  df$fc_spread[i]  <- invert_diff(d_spread, last_spread)
+  df$fc_eurois3m[i]  <- d_eurois3m
+  df$fc_esde[i]     <- invert_diff(d_esde, last_esde)
+  df$fc_iede[i]     <- invert_diff(d_iede, last_iede)
+
+  # Confidence intervals
+  df$fc_spread_lo[i]  <- invert_diff(d_spread  - t_sc * se[4], last_spread)
+  df$fc_spread_up[i]  <- invert_diff(d_spread  + t_sc * se[4], last_spread)
+  
+  df$fc_eurois3m_lo[i]  <- d_eurois3m  - t_sc * se[1]
+  df$fc_eurois3m_up[i]  <- d_eurois3m  + t_sc * se[1]
+  
+  df$fc_esde_lo[i]   <- invert_diff(d_spread - t_sc * se[2], last_spread)
+  df$fc_esde_up[i]   <- invert_diff(d_spread + t_sc * se[2], last_spread)
+  
+  df$fc_iede_lo[i]     <- invert_diff(d_iede - t_sc * se[3], last_iede)
+  df$fc_iede_up[i]     <- invert_diff(d_iede + t_sc * se[3], last_iede)
+  
+  
+
+  if (i %% 25 == 0 || i == len) cat("Step", i, "/", len, "\n")
+}
+
+
+end_time <- proc.time()
+execution_time <- end_time - start_time
+cat("\n Total execution time: ", execution_time[3], "seconds")
+```
+
+Metrics
+```{r}
+rmse <- function(actual, forecast) sqrt(mean((actual - forecast)^2, na.rm = TRUE))
+
+acc_dir <- function(actual, forecast) {
+  d_actual = diff(actual)
+  d_forecast = forecast[-1] - actual[-length(actual)]
+  dir = mean(sign(d_forecast) == sign(d_actual), na.rm = TRUE) * 100
+}
+
+ci_coverage <- function(actual, lo, up) mean(actual >= lo & actual <= up, na.rm = TRUE) * 100
+
+results <- data.frame(
+  variable    = var_names,
+  rmse        = c(
+    rmse(df$act_spread,  df$fc_spread),
+    rmse(df$act_eurois3m, df$fc_eurois3m),
+    rmse(df$act_esde,     df$fc_esde),
+    rmse(df$act_iede,     df$fc_iede)
+    
+  ),
+  acc_dir    = c(
+    acc_dir(df$act_spread, df$fc_spread),
+    acc_dir(df$act_eurois3m, df$fc_eurois3m),
+    acc_dir(df$act_esde,     df$fc_esde),
+    acc_dir(df$act_iede,     df$fc_iede)
+  ),
+  ci_coverage_0.95 = c(
+    ci_coverage(df$act_spread,  df$fc_spread_lo,  df$fc_spread_up),
+    ci_coverage(df$act_eurois3m, df$fc_eurois3m_lo, df$fc_eurois3m_up),
+    ci_coverage(df$act_esde,     df$fc_esde_lo,     df$fc_esde_up),
+    ci_coverage(df$act_iede,     df$fc_iede_lo,     df$fc_iede_up)
+  )
+)
+
+print(results)
+```
+
+## Compare
+I compare the forecast evaluation metrics of the model with a Random Walk model (tomorrow's value = today's value).
+```{r}
+spread_rw <- numeric(len)
+
+for (i in 1:len) {
+  end <- n_train + i
+  spread_rw[i] <- as.numeric(data[n_train + i - 1, "spread"])
+}
+
+df$spread_rw <- spread_rw
+
+rmse_rw = rmse(df$act_spread, df$spread_rw)
+acc_dir_rw = acc_dir(df$act_spread, df$spread_rw)
+cat("\nRMSE RW: ", rmse_rw)
+cat("\nDirection accuracy RW: ", acc_dir_rw)
+```
+
+Model predict the spread like a Random Walk
+```{r, fig.width=12, fig.height=10, out.width="100%"}
+p_spreads  <- ggplot(df, aes(x = date)) +
+  geom_line(aes(y = act_spread, color = "Actual"), linewidth = 0.8) +
+  geom_line(aes(y = fc_spread, color = "Forecasted"), linewidth = 0.8) +
+  geom_line(aes(y = spread_rw, color = "Random Walk"), linewidth = 0.8) +
+  geom_ribbon(aes(ymin = fc_spread_lo, ymax = fc_spread_up), fill = "blue", alpha = 0.3) +
+  scale_color_manual(values = c("Actual" = "black", "Forecasted" = "blue", "Random Walk" = "red")) +
+  labs(title = "Spread: Actual vs Forecasted", x = "", y = "Basis points") +
+  scale_x_date(date_breaks = "2 month", date_labels = "%b-%y") +
+  scale_y_continuous(breaks = scales::breaks_width(20)) +
+  theme_minimal() +
+  theme(legend.title = element_blank(), legend.position = "bottom")
+
+print(p_spreads)
+```
+
+# Forecast
+Next week forecast
+```{r}
+data_fit = tail(d_data, window_size) 
+last_date  <- last(index(data_fit))
+last_spread <- last(data$spread)
+
+fc_var <- vars::VAR(window_data, p = fixed_p, type = "const")
+fc_var_s <- vars::restrict(roll_var, method = "manual", resmat = fixed_params)
+fc <- predict(roll_var_s, n.ahead = 1)
+
+fc_res <- residuals(roll_var_s)
+fc_dcc_fit <- dccfit(dcc_spec, data = roll_res)
+fc_dcc  <- dccforecast(roll_dcc_fit, n.ahead = 1)
+dof  <- fc_dcc_fit@mfit$coef["[Joint]mshape"]
+t_sc <- qt(p = 0.975, df = dof)
+sigma <- rcov(fc_dcc)
+se    <- sqrt(diag(sigma[[1]][, , 1]))
+
+d_spread  <- fc$fcst$spread[1,  "fcst"]
+fc_spread  <- invert_diff(d_spread, last_spread)
+fc_spread_lo  <- invert_diff(d_spread  - t_sc * se[1], last_spread)
+fc_spread_up  <- invert_diff(d_spread  + t_sc * se[1], last_spread)
+
+forecast <- data.frame(
+  spread = fc_spread |> as.numeric(),
+  q_05 = fc_spread_lo |> as.numeric(),
+  q_95 = fc_spread_up |> as.numeric()
+)
+
+cat("\nForecasted values:\n")
+cat("\nSpread on last date: ", as.character(last_date), ": ", last_spread)
+cat("\nSpread forecasted for tomorrow:", as.character(last_date + 1), ":\n")
+print(forecast)
+```
